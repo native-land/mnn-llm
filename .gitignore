@@ -13,3 +13,9 @@ docs/_build/
 
 # ignore files
 .DS_Store
+/.idea/.gitignore
+/.idea/editor.xml
+/.idea/misc.xml
+/.idea/mnn-llm.iml
+/.idea/modules.xml
+/.idea/vcs.xml
