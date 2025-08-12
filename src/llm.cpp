@@ -1,291 +1,373 @@
 //
 //  llm.cpp
+//  大语言模型(LLM)核心实现文件
 //
 //  Created by MNN on 2023/08/25.
 //  ZhaodeWang
 //
 // #define MNN_OPEN_TIME_TRACE 1
 
-#include <fstream>
-#include <iostream>
-#include <regex>
-#include <sstream>
-#include <unordered_set>
+#include <fstream>       // 文件流操作
+#include <iostream>      // 标准输入输出  
+#include <regex>         // 正则表达式处理
+#include <sstream>       // 字符串流操作
+#include <unordered_set> // 无序集合容器
 
-#include <MNN/AutoTime.hpp>
-#include <MNN/expr/ExecutorScope.hpp>
-#include "cpp/ExprDebug.hpp"
-#include "llm.hpp"
-#include "llmconfig.hpp"
-#include "tokenizer.hpp"
-// 0: no debug, 1: test op time, 2: print tensor info, 3: print tensor in output
+#include <MNN/AutoTime.hpp>               // MNN自动计时工具
+#include <MNN/expr/ExecutorScope.hpp>     // MNN执行器作用域管理
+#include "cpp/ExprDebug.hpp"              // MNN表达式调试工具
+#include "llm.hpp"                        // LLM主类定义
+#include "llmconfig.hpp"                  // LLM配置管理类
+#include "tokenizer.hpp"                  // 分词器类定义
+// 调试模式设置: 0: 无调试, 1: 测试操作时间, 2: 打印张量信息, 3: 打印输出张量
 #define DEBUG_MODE 0
 
-#include "httplib.h"
+#include "httplib.h"                      // HTTP客户端库，用于网络请求
 #ifdef LLM_SUPPORT_VISION
-#include <cv/cv.hpp>
+#include <cv/cv.hpp>  // 视觉支持相关头文件
 #endif
 #ifdef LLM_SUPPORT_AUDIO
-#include <audio/audio.hpp>
+#include <audio/audio.hpp>  // 音频支持相关头文件
 #endif
 
-using namespace MNN::Express;
+using namespace MNN::Express;  // 使用MNN表达式命名空间
 namespace MNN {
 namespace Transformer {
+// KV缓存元数据结构，用于管理键值对缓存的状态和内存分配
 struct KVMeta {
-    size_t block = 4096;
-    size_t previous = 0;
-    size_t remove = 0;
-    int* reserve = nullptr;
-    int n_reserve = 0;
-    size_t add = 0;
-    std::vector<int> reserveHost;
+    size_t block = 4096;      // 块大小，默认4096，用于内存块管理
+    size_t previous = 0;      // 之前的序列长度，记录历史token数量
+    size_t remove = 0;        // 需要移除的token数量，用于缓存清理
+    int* reserve = nullptr;   // 保留区域指针，指向需要保留的内存区域
+    int n_reserve = 0;        // 保留区域数量
+    size_t add = 0;           // 新增的token数量
+    std::vector<int> reserveHost;  // 主机端保留数据的缓存
+    
+    // 同步缓存状态，更新序列长度并重置临时变量
     void sync() {
         int revertNumber = 0;
+        // 遍历保留区域，累计需要恢复的数量
         for (int i=0; i<n_reserve; ++i) {
-            revertNumber += reserve[2*i+1];
+            revertNumber += reserve[2*i+1];  // 每个保留区域的第二个值表示恢复数量
         }
+        // 更新总的序列长度：之前的长度 - 移除数量 + 新增数量 + 恢复数量
         previous = previous - remove + add + revertNumber;
+        // 重置临时状态变量
         n_reserve = 0;
         reserve = nullptr;
         remove = 0;
         add = 0;
     }
 };
+// 反量化函数类型定义：将量化的uint8数据转换为float数据
 typedef void (*DequantFunction)(const uint8_t*, float*, float, float, int);
 
+// 4位量化反量化函数（参考实现）
+// 将4位量化的数据转换回float类型
 static void q41_dequant_ref(const uint8_t* src, float* dst, float scale, float zero, int size) {
     for (int i = 0; i < size / 2; i++) {
-        int x          = src[i];
-        int x1         = x / 16 - 8;
-        int x2         = x % 16 - 8;
-        float w1       = x1 * scale + zero;
-        float w2       = x2 * scale + zero;
-        dst[2 * i]     = w1;
-        dst[2 * i + 1] = w2;
+        int x          = src[i];         // 读取一个字节，包含两个4位数值
+        int x1         = x / 16 - 8;     // 提取高4位并减去偏移量8
+        int x2         = x % 16 - 8;     // 提取低4位并减去偏移量8
+        float w1       = x1 * scale + zero;  // 反量化第一个值
+        float w2       = x2 * scale + zero;  // 反量化第二个值
+        dst[2 * i]     = w1;             // 存储第一个反量化值
+        dst[2 * i + 1] = w2;             // 存储第二个反量化值
     }
 }
 
+// 8位量化反量化函数（参考实现）
+// 将8位量化的数据转换回float类型
 static void q81_dequant_ref(const uint8_t* src, float* dst, float scale, float zero, int size) {
     for (int i = 0; i < size; i++) {
+        // 8位量化: 减去128（无符号转有符号），然后应用缩放和零点
         dst[i] = (src[i] - 128) * scale + zero;
     }
 }
 
+// 磁盘嵌入类：用于从磁盘文件中读取词向量嵌入，以节省内存使用
+// 支持量化和非量化两种存储格式，动态加载需要的嵌入向量
 class DiskEmbedding {
 public:
+    // 构造函数：根据配置文件初始化磁盘嵌入
     explicit DiskEmbedding(const std::shared_ptr<LlmConfig>& config);
+    
+    // 析构函数：清理资源
     ~DiskEmbedding() {
     }
+    
+    // 根据输入的token ID序列生成对应的嵌入向量
+    // input_ids: token ID序列
+    // ptr: 输出嵌入向量的指针
     void embedding(const std::vector<int>& input_ids, float* ptr);
 
 private:
+    // 从文件指定偏移位置读取数据到目标缓冲区
     void seek_read(uint8_t* dst, size_t size, size_t offset);
-    std::unique_ptr<uint8_t[]> alpha_  = nullptr;
-    std::unique_ptr<uint8_t[]> weight_ = nullptr;
-    std::unique_ptr<FILE, decltype(&fclose)> fp_;
-    DequantFunction dequant_;
-    int hidden_size_, weight_token_size_;
-    int64_t w_offset_, block_num_, quant_block_, quant_bit_;
+    
+    std::unique_ptr<uint8_t[]> alpha_;   // 量化参数缓冲区（缩放因子和零点）
+    std::unique_ptr<uint8_t[]> weight_;  // 权重数据缓冲区
+    std::unique_ptr<FILE, decltype(&fclose)> fp_;  // 文件指针，用RAII管理
+    DequantFunction dequant_;            // 反量化函数指针
+    int hidden_size_, weight_token_size_; // 隐藏层维度和每个token权重大小
+    int64_t w_offset_, block_num_, quant_block_, quant_bit_; // 文件偏移、块数量、量化块大小、量化位数
 };
 
+// 从文件指定偏移位置读取数据到目标缓冲区
 void DiskEmbedding::seek_read(uint8_t* dst, size_t size, size_t offset) {
-    fseek(fp_.get(), offset, SEEK_SET);
-    size_t bytes_read = fread(dst, 1, size, fp_.get());
-    (void)bytes_read;
+    fseek(fp_.get(), offset, SEEK_SET);  // 移动文件指针到指定偏移位置
+    size_t bytes_read = fread(dst, 1, size, fp_.get());  // 读取指定大小的数据
+    (void)bytes_read;  // 避免未使用变量警告
 }
 
+// DiskEmbedding构造函数：初始化磁盘嵌入系统
 DiskEmbedding::DiskEmbedding(const std::shared_ptr<LlmConfig>& config) : fp_(nullptr, &fclose) {
-    auto tie_embeddings = config->tie_embeddings();
-    hidden_size_        = config->hidden_size();
+    auto tie_embeddings = config->tie_embeddings();  // 获取绑定嵌入配置
+    hidden_size_        = config->hidden_size();     // 获取隐藏层维度
+    
     if (tie_embeddings.size() == 5) {
-        w_offset_          = tie_embeddings[0];
-        quant_bit_         = tie_embeddings[3];
-        quant_block_       = tie_embeddings[4];
-        block_num_         = hidden_size_ / quant_block_;
-        weight_token_size_ = hidden_size_ * quant_bit_ / 8;
-        fp_.reset(fopen(config->llm_weight().c_str(), "rb"));
-        // TODO: optimize dequant function
-        dequant_        = quant_bit_ == 8 ? q81_dequant_ref : q41_dequant_ref;
-        auto a_offset   = tie_embeddings[1];
-        auto alpha_size = tie_embeddings[2];
-        alpha_.reset(new uint8_t[alpha_size]);
-        seek_read(alpha_.get(), alpha_size, a_offset);
+        // 量化嵌入模式：从主权重文件中读取量化的嵌入数据
+        w_offset_          = tie_embeddings[0];  // 权重在文件中的偏移
+        quant_bit_         = tie_embeddings[3];  // 量化位数（4位或8位）
+        quant_block_       = tie_embeddings[4];  // 量化块大小
+        block_num_         = hidden_size_ / quant_block_;  // 计算块数量
+        weight_token_size_ = hidden_size_ * quant_bit_ / 8;  // 每个token的权重字节数
+        fp_.reset(fopen(config->llm_weight().c_str(), "rb"));  // 打开权重文件
+        
+        // TODO: 优化反量化函数选择
+        dequant_        = quant_bit_ == 8 ? q81_dequant_ref : q41_dequant_ref;  // 选择对应的反量化函数
+        auto a_offset   = tie_embeddings[1];  // alpha参数偏移
+        auto alpha_size = tie_embeddings[2];  // alpha参数大小
+        alpha_.reset(new uint8_t[alpha_size]);  // 分配alpha参数缓冲区
+        seek_read(alpha_.get(), alpha_size, a_offset);  // 读取alpha参数
     } else {
-        weight_token_size_ = hidden_size_ * sizeof(int16_t);
-        fp_.reset(fopen(config->embedding_file().c_str(), "rb"));
+        // 非量化嵌入模式：使用专门的嵌入文件（bf16格式）
+        weight_token_size_ = hidden_size_ * sizeof(int16_t);  // bf16格式，每个元素2字节
+        fp_.reset(fopen(config->embedding_file().c_str(), "rb"));  // 打开嵌入文件
     }
-    weight_.reset(new uint8_t[weight_token_size_]);
+    weight_.reset(new uint8_t[weight_token_size_]);  // 分配权重缓冲区
 }
 
+// 根据token ID序列生成对应的嵌入向量
 void DiskEmbedding::embedding(const std::vector<int>& input_ids, float* dst) {
     if (alpha_.get()) {
-        // quant
+        // 量化模式：需要读取量化数据并反量化
         for (size_t i = 0; i < input_ids.size(); i++) {
-            int token = input_ids[i];
+            int token = input_ids[i];  // 当前token ID
+            // 读取该token对应的量化权重数据
             seek_read(weight_.get(), weight_token_size_, w_offset_ + token * weight_token_size_);
-            auto dptr      = dst + i * hidden_size_;
-            auto alpha_ptr = reinterpret_cast<float*>(alpha_.get()) + token * block_num_ * 2;
+            auto dptr      = dst + i * hidden_size_;  // 目标输出位置
+            auto alpha_ptr = reinterpret_cast<float*>(alpha_.get()) + token * block_num_ * 2;  // alpha参数位置
+            
+            // 按块进行反量化
             for (int n = 0; n < block_num_; n++) {
-                auto dst_ptr     = dptr + n * quant_block_;
-                uint8_t* src_ptr = weight_.get() + n * (quant_block_ * quant_bit_ / 8);
-                float zero       = (alpha_ptr + n * 2)[0];
-                float scale      = (alpha_ptr + n * 2)[1];
-                dequant_(src_ptr, dst_ptr, scale, zero, quant_block_);
+                auto dst_ptr     = dptr + n * quant_block_;  // 当前块的输出位置
+                uint8_t* src_ptr = weight_.get() + n * (quant_block_ * quant_bit_ / 8);  // 当前块的输入位置
+                float zero       = (alpha_ptr + n * 2)[0];    // 零点参数
+                float scale      = (alpha_ptr + n * 2)[1];    // 缩放因子参数
+                dequant_(src_ptr, dst_ptr, scale, zero, quant_block_);  // 执行反量化
             }
         }
     } else {
-        // bf16
+        // bf16模式：直接读取bf16数据并转换为float
         for (size_t i = 0; i < input_ids.size(); i++) {
+            // 读取该token对应的bf16权重数据
             seek_read(weight_.get(), weight_token_size_, input_ids[i] * weight_token_size_);
             int16_t* dst_ptr = reinterpret_cast<int16_t*>(dst + i * hidden_size_);
+            
+            // 将bf16格式转换为float：bf16在内存中是高16位，低16位为0
             for (int j = 0; j < hidden_size_; j++) {
-                dst_ptr[j * 2]     = 0;
-                dst_ptr[j * 2 + 1] = reinterpret_cast<int16_t*>(weight_.get())[j];
+                dst_ptr[j * 2]     = 0;  // 低16位设为0
+                dst_ptr[j * 2 + 1] = reinterpret_cast<int16_t*>(weight_.get())[j];  // 高16位来自文件
             }
         }
     }
 }
 
+// 多模态大语言模型类：继承自Llm，支持视觉和音频输入处理
+// 能够处理图像和音频数据，将其转换为token序列并与文本一起输入模型
 class Mllm : public Llm {
 public:
+    // 构造函数：初始化多模态LLM，配置视觉和音频参数
     Mllm(std::shared_ptr<LlmConfig> config) : Llm(config) {
         if (config->is_visual()) {
-            image_height_  = config->llm_config_.value("image_size", image_height_);
-            image_width_   = image_height_;
-            img_pad_       = config->llm_config_.value("image_pad", img_pad_);
-            vision_start_  = config->llm_config_.value("vision_start", vision_start_);
-            vision_end_    = config->llm_config_.value("vision_end", vision_end_);
-            image_mean_    = config->llm_config_.value("image_mean", image_mean_);
-            image_norm_    = config->llm_config_.value("image_norm", image_norm_);
+            // 配置视觉相关参数
+            image_height_  = config->llm_config_.value("image_size", image_height_);   // 图像高度
+            image_width_   = image_height_;                                           // 图像宽度（通常为正方形）
+            img_pad_       = config->llm_config_.value("image_pad", img_pad_);        // 图像填充token ID
+            vision_start_  = config->llm_config_.value("vision_start", vision_start_); // 视觉序列开始token
+            vision_end_    = config->llm_config_.value("vision_end", vision_end_);     // 视觉序列结束token
+            image_mean_    = config->llm_config_.value("image_mean", image_mean_);     // 图像均值（用于归一化）
+            image_norm_    = config->llm_config_.value("image_norm", image_norm_);     // 图像标准差（用于归一化）
         }
         if (config->is_audio()) {
+            // 音频配置预留（待实现）
         }
     }
+    
+    // 析构函数：清理多模态模块资源
     ~Mllm() {
-        mul_module_.reset();
+        mul_module_.reset();  // 释放多模态模块
     }
+    
+    // 重写基类方法：加载多模态模型
     virtual void load() override;
+    
+    // 重写基类方法：支持多模态内容的token编码
     virtual std::vector<int> tokenizer_encode(const std::string& query, bool use_template = true) override;
+    
+    // 重写基类方法：生成包含多模态内容的嵌入向量
     virtual MNN::Express::VARP embedding(const std::vector<int>& input_ids) override;
 
 private:
-    // vision config
-    int image_height_ = 448, image_width_ = 448, vision_start_ = 151857, vision_end_ = 151858, img_pad_ = 151859;
-    std::vector<float> image_mean_{122.7709383, 116.7460125, 104.09373615};
-    std::vector<float> image_norm_{0.01459843, 0.01500777, 0.01422007};
-    // audio config
-    int audio_pad_ = 151646;
-    std::vector<int> multimode_process(const std::string& mode, std::string info);
-    std::vector<int> vision_process(const std::string& file);
-    std::vector<int> audio_process(const std::string& file);
-    std::shared_ptr<Module> mul_module_;
-    std::vector<VARP> mul_embeddings_;
+    // 视觉配置参数
+    int image_height_ = 448, image_width_ = 448;                                    // 输入图像尺寸
+    int vision_start_ = 151857, vision_end_ = 151858, img_pad_ = 151859;           // 视觉相关的特殊token ID
+    std::vector<float> image_mean_{122.7709383, 116.7460125, 104.09373615};       // RGB图像均值
+    std::vector<float> image_norm_{0.01459843, 0.01500777, 0.01422007};           // RGB图像标准差
+    
+    // 音频配置参数
+    int audio_pad_ = 151646;  // 音频填充token ID
+    
+    // 私有方法声明
+    std::vector<int> multimode_process(const std::string& mode, std::string info);  // 多模态数据处理
+    std::vector<int> vision_process(const std::string& file);                       // 视觉数据处理
+    std::vector<int> audio_process(const std::string& file);                        // 音频数据处理
+    
+    // 多模态模块和嵌入缓存
+    std::shared_ptr<Module> mul_module_;   // 多模态处理模块（视觉或音频编码器）
+    std::vector<VARP> mul_embeddings_;     // 多模态嵌入向量缓存
 };
 
-// Llm start
+// === Llm 类实现开始 ===
+
+// 静态工厂方法：根据配置文件路径创建LLM实例
+// 自动判断是否需要多模态支持，返回对应的LLM或Mllm实例
 Llm* Llm::createLLM(const std::string& config_path) {
-    std::shared_ptr<LlmConfig> config(new LlmConfig(config_path));
+    std::shared_ptr<LlmConfig> config(new LlmConfig(config_path));  // 解析配置文件
     Llm* llm = nullptr;
+    
+    // 根据配置判断是否需要多模态支持
     if (config->is_visual() || config->is_audio()) {
-        llm = new Mllm(config);
+        llm = new Mllm(config);  // 创建多模态LLM实例
     } else {
-        llm = new Llm(config);
+        llm = new Llm(config);   // 创建标准LLM实例
     }
     return llm;
 }
 
+// 后端类型转换函数：将字符串类型转换为MNN后端枚举
 static MNNForwardType backend_type_convert(const std::string& type_str) {
-    if (type_str == "cpu")
-        return MNN_FORWARD_CPU;
-    if (type_str == "metal")
-        return MNN_FORWARD_METAL;
-    if (type_str == "cuda")
-        return MNN_FORWARD_CUDA;
-    if (type_str == "opencl")
-        return MNN_FORWARD_OPENCL;
-    if (type_str == "opengl")
-        return MNN_FORWARD_OPENGL;
-    if (type_str == "vulkan")
-        return MNN_FORWARD_VULKAN;
-    if (type_str == "npu")
-        return MNN_FORWARD_NN;
-    return MNN_FORWARD_AUTO;
+    if (type_str == "cpu")        return MNN_FORWARD_CPU;      // CPU后端
+    if (type_str == "metal")      return MNN_FORWARD_METAL;    // Metal后端（iOS/macOS GPU）
+    if (type_str == "cuda")       return MNN_FORWARD_CUDA;     // CUDA后端（NVIDIA GPU）
+    if (type_str == "opencl")     return MNN_FORWARD_OPENCL;   // OpenCL后端（通用GPU）
+    if (type_str == "opengl")     return MNN_FORWARD_OPENGL;   // OpenGL后端
+    if (type_str == "vulkan")     return MNN_FORWARD_VULKAN;   // Vulkan后端
+    if (type_str == "npu")        return MNN_FORWARD_NN;       // NPU后端（神经处理单元）
+    return MNN_FORWARD_AUTO;      // 自动选择后端
 }
 
+// 导出配置信息为JSON字符串
 std::string Llm::dump_config() {
     return config_->config_.dump();
 }
 
+// 设置配置信息：合并新的JSON配置
 bool Llm::set_config(const std::string& content) {
     return config_->config_.merge(content.c_str());
 }
 
+// 获取文件大小（以MB为单位）
 int file_size_m(const std::string& filename) {
-    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);  // 打开文件并移到末尾
     if (!file.is_open()) {
         std::cerr << "Could not open the file!" << std::endl;
         return -1;
     }
-    long long fileSize = file.tellg();
+    long long fileSize = file.tellg();  // 获取文件大小（字节）
     file.close();
-    return fileSize / (1024 * 1024);
+    return fileSize / (1024 * 1024);    // 转换为MB
 }
 
+// 初始化运行时环境：配置MNN执行器和各种优化选项
 void Llm::init_runtime() {
+    // 配置调度和后端参数
     ScheduleConfig config;
     BackendConfig cpuBackendConfig;
-    config.type      = backend_type_convert(config_->backend_type());
-    config.numThread = config_->thread_num();
+    config.type      = backend_type_convert(config_->backend_type());  // 设置后端类型
+    config.numThread = config_->thread_num();                          // 设置线程数
+    
+    // 设置全局执行器配置
     ExecutorScope::Current()->setGlobalExecutorConfig(config.type, cpuBackendConfig, config.numThread);
+    
+    // 配置功耗模式
     if (config_->power() == "high") {
-        cpuBackendConfig.power = BackendConfig::Power_High;
+        cpuBackendConfig.power = BackendConfig::Power_High;      // 高性能模式
     } else if (config_->power() == "low") {
-        cpuBackendConfig.power = BackendConfig::Power_Low;
+        cpuBackendConfig.power = BackendConfig::Power_Low;       // 低功耗模式
     }
+    
+    // 配置内存使用策略
     if (config_->memory() == "high") {
-        cpuBackendConfig.memory = BackendConfig::Memory_High;
+        cpuBackendConfig.memory = BackendConfig::Memory_High;    // 高内存使用（更多缓存）
     } else if (config_->memory() == "low") {
-        cpuBackendConfig.memory = BackendConfig::Memory_Low;
+        cpuBackendConfig.memory = BackendConfig::Memory_Low;     // 低内存使用（节省内存）
     }
+    
+    // 配置精度模式
     if (config_->precision() == "high") {
-        cpuBackendConfig.precision = BackendConfig::Precision_High;
+        cpuBackendConfig.precision = BackendConfig::Precision_High;  // 高精度计算
     } else if (config_->precision() == "low") {
-        cpuBackendConfig.precision = BackendConfig::Precision_Low;
+        cpuBackendConfig.precision = BackendConfig::Precision_Low;   // 低精度计算（更快）
     }
+    
     config.backendConfig = &cpuBackendConfig;
 
+    // 创建运行时管理器
     runtime_manager_.reset(Executor::RuntimeManager::createRuntimeManager(config));
-    runtime_manager_->setHint(MNN::Interpreter::MEM_ALLOCATOR_TYPE, 0);
-    runtime_manager_->setHint(MNN::Interpreter::DYNAMIC_QUANT_OPTIONS, 1); // 1: per batch quant, 2: per tensor quant
-    runtime_manager_->setHint(MNN::Interpreter::QKV_QUANT_OPTIONS, config_->quant_qkv());
-    runtime_manager_->setHint(MNN::Interpreter::KVCACHE_SIZE_LIMIT, config_->kvcache_limit());
-    runtime_manager_->setHint(MNN::Interpreter::MMAP_FILE_SIZE, file_size_m(config_->llm_weight()) + 128);
-    runtime_manager_->setHint(MNN::Interpreter::USE_CACHED_MMAP, 1);
+    
+    // 设置各种运行时优化选项
+    runtime_manager_->setHint(MNN::Interpreter::MEM_ALLOCATOR_TYPE, 0);              // 内存分配器类型
+    runtime_manager_->setHint(MNN::Interpreter::DYNAMIC_QUANT_OPTIONS, 1);           // 动态量化选项：1=按批次量化, 2=按张量量化
+    runtime_manager_->setHint(MNN::Interpreter::QKV_QUANT_OPTIONS, config_->quant_qkv());     // QKV量化选项
+    runtime_manager_->setHint(MNN::Interpreter::KVCACHE_SIZE_LIMIT, config_->kvcache_limit()); // KV缓存大小限制
+    runtime_manager_->setHint(MNN::Interpreter::MMAP_FILE_SIZE, file_size_m(config_->llm_weight()) + 128); // 内存映射文件大小
+    runtime_manager_->setHint(MNN::Interpreter::USE_CACHED_MMAP, 1);                 // 使用缓存的内存映射
+    
     std::string tmpPath = config_->tmp_path();
+    
+    // 配置KV缓存内存映射路径
     if (config_->kvcache_mmap()) {
         runtime_manager_->setExternalPath(tmpPath, MNN::Interpreter::EXTERNAL_PATH_KVCACHE_DIR);
     }
+    
+    // 配置权重内存映射路径
     if (config_->use_mmap()) {
         runtime_manager_->setExternalPath(tmpPath, MNN::Interpreter::EXTERNAL_WEIGHT_DIR);
     }
+    
+    // 设置KV缓存元数据指针
     runtime_manager_->setHintPtr(Interpreter::KVCACHE_INFO, mMeta.get());
 
+    // 调试模式配置
 #if DEBUG_MODE == 1
-    runtime_manager_->setMode(MNN::Interpreter::Session_Debug);
-    _initTimeTrace();
+    runtime_manager_->setMode(MNN::Interpreter::Session_Debug);  // 启用调试模式
+    _initTimeTrace();                                            // 初始化时间追踪
 #endif
 #if DEBUG_MODE == 2
-    runtime_manager_->setMode(MNN::Interpreter::Session_Debug);
-    _initTensorStatic();
+    runtime_manager_->setMode(MNN::Interpreter::Session_Debug);  // 启用调试模式
+    _initTensorStatic();                                         // 初始化张量统计
 #endif
 #if DEBUG_MODE == 3
-    runtime_manager_->setMode(MNN::Interpreter::Session_Debug);
-    _initDebug();
+    runtime_manager_->setMode(MNN::Interpreter::Session_Debug);  // 启用调试模式
+    _initDebug();                                                // 初始化调试信息
 #endif
+    
+    // 设置缓存文件路径
     {
-        std::string cacheFilePath = tmpPath.length() != 0 ? tmpPath : ".";
-        runtime_manager_->setCache(cacheFilePath + "/mnn_cachefile.bin");
+        std::string cacheFilePath = tmpPath.length() != 0 ? tmpPath : ".";  // 默认使用当前目录
+        runtime_manager_->setCache(cacheFilePath + "/mnn_cachefile.bin");   // 设置缓存文件
     }
 }
 
@@ -460,29 +542,37 @@ VARP Llm::forward(const std::vector<int>& input_ids) {
     return logits;
 }
 
+// 采样方法：从logits中选择下一个token
+// 使用贪心策略（argmax）并应用重复惩罚来提高生成质量
 int Llm::sample(VARP logits, const std::vector<int>& pre_ids, int offset, int size) {
-    std::unordered_set<int> ids_set(pre_ids.begin(), pre_ids.end());
-    auto scores = (float*)(logits->readMap<float>()) + offset;
+    std::unordered_set<int> ids_set(pre_ids.begin(), pre_ids.end());  // 将历史token转为集合，用于快速查找
+    auto scores = (float*)(logits->readMap<float>()) + offset;        // 获取logits分数指针
+    
     if (0 == size) {
-        size = logits->getInfo()->size;
+        size = logits->getInfo()->size;  // 如果未指定大小，使用logits的完整大小
     }
-    // repetition penalty
-    const float repetition_penalty = 1.1;
+    
+    // 应用重复惩罚：降低已生成token的概率，避免重复
+    const float repetition_penalty = 1.1;  // 重复惩罚系数
     for (auto id : ids_set) {
         float score = scores[id];
-        scores[id]  = score < 0 ? score * repetition_penalty : score / repetition_penalty;
+        // 如果分数为负，增大惩罚；如果为正，减小奖励
+        scores[id] = score < 0 ? score * repetition_penalty : score / repetition_penalty;
     }
-    // argmax
-    float max_score = scores[0];
-    int token_id = 0;
+    
+    // 贪心搜索：选择分数最高的token（argmax）
+    float max_score = scores[0];  // 初始化最大分数
+    int token_id = 0;             // 初始化选中的token ID
+    
     for (int i = 1; i < size; i++) {
         float score = scores[i];
         if (score > max_score) {
-            max_score = score;
-            token_id  = i;
+            max_score = score;  // 更新最大分数
+            token_id  = i;      // 更新最佳token ID
         }
     }
-    return token_id;
+    
+    return token_id;  // 返回选中的token ID
 }
 
 static std::string apply_template(std::string prompt_template, const std::string& content,
@@ -608,65 +698,102 @@ void Llm::eraseHistory(size_t begin, size_t end) {
     }
 }
 
+// 检查是否应该停止生成（遇到停止token）
 bool Llm::stoped() {
     return is_stop(mState.current_token_);
 }
 
+// 增量生成方法：逐个生成token直到达到最大数量或遇到停止条件
+// 这是解码阶段的核心循环，每次生成一个新token
 void Llm::generate(int max_token) {
-    int len = 0;
+    int len = 0;  // 已生成的token数量计数器
+    
     while (len < max_token) {
-        auto st = std::chrono::system_clock::now();
+        auto st = std::chrono::system_clock::now();  // 记录开始时间，用于性能统计
+        
+        // 如果设置了输出流，实时输出解码的token
         if (nullptr != mState.os_) {
-            *mState.os_ << tokenizer_decode(mState.current_token_);
-            *mState.os_ << std::flush;
+            *mState.os_ << tokenizer_decode(mState.current_token_);  // 解码并输出当前token
+            *mState.os_ << std::flush;                               // 立即刷新输出
         }
-        mState.history_ids_.push_back(mState.current_token_);
-        mMeta->add = 1;
-        mMeta->remove = 0;
+        
+        // 更新状态和KV缓存信息
+        mState.history_ids_.push_back(mState.current_token_);  // 将当前token添加到历史记录
+        mMeta->add = 1;      // 标记新增1个token到KV缓存
+        mMeta->remove = 0;   // 无需移除任何token
+        
+        // 前向推理：使用当前token生成下一个token的logits
         auto logits = forward({mState.current_token_});
-        mMeta->sync();
-        len++;
+        mMeta->sync();       // 同步KV缓存状态
+        len++;              // 增加生成计数
+        
+        // 检查推理是否成功
         if (nullptr == logits.get()) {
-            break;
+            break;  // 推理失败，退出
         }
         if (logits->getInfo()->size == 0) {
-            break;
+            break;  // logits为空，退出
         }
+        
+        // 采样下一个token
         mState.current_token_ = sample(logits, mState.history_ids_);
-        auto et = std::chrono::system_clock::now();
+        
+        auto et = std::chrono::system_clock::now();  // 记录结束时间
+        // 累计解码时间统计
         mState.decode_us_ += std::chrono::duration_cast<std::chrono::microseconds>(et - st).count();
+        
+        // 检查是否遇到停止token
         if (is_stop(mState.current_token_) && nullptr != mState.os_) {
-            *mState.os_ << mState.end_with_ << std::flush;
-            break;
+            *mState.os_ << mState.end_with_ << std::flush;  // 输出结束标记
+            break;  // 遇到停止token，结束生成
         }
     }
 }
 
+// 完整生成方法：给定输入token序列，生成指定数量的新token
+// 这是LLM生成的主要入口，包含预填充（prefill）和解码（decode）两个阶段
 std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens) {
     if (max_tokens < 0) {
-        max_tokens = config_->max_new_tokens();
+        max_tokens = config_->max_new_tokens();  // 使用配置文件中的默认最大token数
     }
-    mMeta->add = input_ids.size();
-    mState.prompt_len_ = static_cast<int>(input_ids.size());
-    mState.history_ids_.insert(mState.history_ids_.end(), input_ids.begin(), input_ids.end()); // push to history_ids_
-    auto st          = std::chrono::system_clock::now();
+    
+    // 设置KV缓存和状态信息
+    mMeta->add = input_ids.size();  // 标记需要添加的token数量（即输入序列长度）
+    mState.prompt_len_ = static_cast<int>(input_ids.size());  // 记录提示词长度
+    // 将输入token序列添加到历史记录中
+    mState.history_ids_.insert(mState.history_ids_.end(), input_ids.begin(), input_ids.end());
+    
+    auto st = std::chrono::system_clock::now();  // 记录预填充开始时间
+    
+    // === 预填充阶段（Prefill Phase）===
+    // 使用预填充模块处理整个输入序列，一次性计算所有输入token的KV缓存
     current_modules_ = prefill_modules_;
-    auto logits      = forward(input_ids);
+    auto logits = forward(input_ids);  // 前向推理，生成最后一个位置的logits
+    
     if (nullptr == logits.get()) {
-        return {};
+        return {};  // 预填充失败，返回空结果
     }
+    
+    // 采样第一个生成的token
     mState.current_token_ = sample(logits, mState.history_ids_);
-    logits = nullptr;
-    auto et = std::chrono::system_clock::now();
-    current_modules_ = decode_modules_;
+    logits = nullptr;  // 释放logits内存
+    
+    auto et = std::chrono::system_clock::now();  // 记录预填充结束时间
+    
+    // === 解码阶段准备（Decode Phase Setup）===
+    current_modules_ = decode_modules_;  // 切换到解码模块（针对单token推理优化）
+    // 记录预填充阶段耗时
     mState.prefill_us_ = std::chrono::duration_cast<std::chrono::microseconds>(et - st).count();
-    mMeta->sync();
+    mMeta->sync();  // 同步KV缓存状态
+    
+    // === 解码阶段（Decode Phase）===
+    // 逐个生成新token，直到达到最大数量或遇到停止条件
     generate(max_tokens);
 
 #ifdef DUMP_PROFILE_INFO
-    print_speed();
+    print_speed();  // 如果启用性能分析，打印速度统计信息
 #endif
-    return mState.output_ids_;
+    return mState.output_ids_;  // 返回生成的token序列
 }
 
 std::vector<int> Llm::tokenizer_encode(const std::string& user_content, bool use_template) {
@@ -1017,154 +1144,228 @@ printf("]\n}\n");
 }
 }
 
+// 视觉处理方法：将图像文件转换为token序列
+// 支持多种视觉模型架构，包括标准模型和Qwen2-VL等
 std::vector<int> Mllm::vision_process(const std::string& file) {
 #ifdef LLM_SUPPORT_VISION
-    VARP image = MNN::CV::imread(file);
-    auto st    = std::chrono::system_clock::now();
+    VARP image = MNN::CV::imread(file);  // 读取图像文件
+    auto st    = std::chrono::system_clock::now();  // 开始计时
     VARP image_embedding;
 
+    // 检查是否为Qwen2-VL模型（基于输入名称判断）
     if (mul_module_->getInfo()->inputNames[0] == "patches") {
-        // Qwen2-VL
+        // === Qwen2-VL 处理流程 ===
+        // 调整图像尺寸为28的倍数（适配patch分割）
         image_height_ = round(image_height_ / 28.0) * 28;
         image_width_ = round(image_width_ / 28.0) * 28;
-        image        = MNN::CV::resize(image, {image_height_, image_width_}, 0, 0,
+        
+        // 图像预处理：缩放、颜色空间转换、归一化
+        image = MNN::CV::resize(image, {image_height_, image_width_}, 0, 0,
                                      MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
                                      image_mean_, image_norm_);
-        image        = MNN::Express::_Unsqueeze(image, {0});
-        image        = MNN::Express::_Convert(image, NCHW);
+        image = MNN::Express::_Unsqueeze(image, {0});  // 添加批次维度
+        image = MNN::Express::_Convert(image, NCHW);   // 转换为NCHW格式
+        
+        // 构造时序patches（将单张图像复制为时序序列）
         auto patches = MNN::Express::_Concat({image, image}, 0);
         auto patches_dim = patches->getInfo()->dim;
-        int temporal = patches_dim[0];
-        int channel  = patches_dim[1];
-        int height   = patches_dim[2];
-        int width    = patches_dim[3];
-        constexpr int temporal_patch_size = 2;
-        constexpr int patch_size = 14;
-        constexpr int merge_size = 2;
-        int grid_t = temporal / temporal_patch_size;
-        int grid_h = height / patch_size;
-        int grid_w = width / patch_size;
-        // build patches
+        int temporal = patches_dim[0];  // 时序维度
+        int channel  = patches_dim[1];  // 通道维度
+        int height   = patches_dim[2];  // 高度维度
+        int width    = patches_dim[3];  // 宽度维度
+        
+        // 定义patch参数
+        constexpr int temporal_patch_size = 2;  // 时序patch大小
+        constexpr int patch_size = 14;          // 空间patch大小
+        constexpr int merge_size = 2;           // 合并大小
+        
+        // 计算网格维度
+        int grid_t = temporal / temporal_patch_size;  // 时序网格数
+        int grid_h = height / patch_size;             // 高度网格数
+        int grid_w = width / patch_size;              // 宽度网格数
+        
+        // 构造patches：将图像分割为patch序列
         patches = MNN::Express::_Reshape(patches, {
             grid_t, temporal_patch_size,
             channel,
             grid_h / merge_size, merge_size, patch_size,
             grid_w / merge_size, merge_size, patch_size,
         });
+        // 重新排列patch维度
         patches = MNN::Express::_Permute(patches, {0, 3, 6, 4, 7, 2, 1, 5, 8});
+        // 展平为序列格式
         patches = MNN::Express::_Reshape(patches, {
             grid_t * grid_h * grid_w,
             channel * temporal_patch_size * patch_size * patch_size
         });
-        const int seq_len = grid_t * grid_h * grid_w;
-        // build position_ids
+        
+        const int seq_len = grid_t * grid_h * grid_w;  // 序列长度
+        
+        // 构造位置编码（2D位置信息）
         const int wblock_size = merge_size * merge_size;
         const int hblock_size = wblock_size * grid_w / merge_size;
         VARP position_ids = MNN::Express::_Input({2, seq_len}, NCHW, halide_type_of<int>());
-        auto hpos_ptr = position_ids->writeMap<int>();
-        auto wpos_ptr = hpos_ptr + seq_len;
+        auto hpos_ptr = position_ids->writeMap<int>();  // 高度位置指针
+        auto wpos_ptr = hpos_ptr + seq_len;             // 宽度位置指针
+        
+        // 填充位置编码
         for (int i = 0; i < grid_h; i++) {
             int h_idx = i / merge_size, h_off = i % merge_size;
             for (int j = 0; j < grid_w; j++) {
                 int w_idx = j / merge_size, w_off = j % merge_size;
                 int index = h_idx * hblock_size + w_idx * wblock_size + h_off * 2 + w_off;
-                hpos_ptr[index] = i;
-                wpos_ptr[index] = j;
+                hpos_ptr[index] = i;  // 设置高度位置
+                wpos_ptr[index] = j;  // 设置宽度位置
             }
         }
-        // build attention_mask
+        
+        // 构造注意力掩码（全零，表示所有位置都可见）
         VARP attention_mask = MNN::Express::_Input({1, seq_len, seq_len}, NCHW);
         ::memset(attention_mask->writeMap<float>(), 0, seq_len * seq_len * sizeof(float));
+        
+        // 通过视觉编码器生成图像嵌入
         image_embedding = mul_module_->onForward({patches, position_ids, attention_mask})[0];
     } else {
-        image           = MNN::CV::resize(image, {image_height_, image_width_}, 0, 0,
-                                          MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
-                                          image_mean_, image_norm_);
-        image           = MNN::Express::_Unsqueeze(image, {0});
-        image           = MNN::Express::_Convert(image, NC4HW4);
+        // === 标准视觉模型处理流程 ===
+        // 图像预处理：缩放、颜色转换、归一化
+        image = MNN::CV::resize(image, {image_height_, image_width_}, 0, 0,
+                                      MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
+                                      image_mean_, image_norm_);
+        image = MNN::Express::_Unsqueeze(image, {0});  // 添加批次维度
+        image = MNN::Express::_Convert(image, NC4HW4);  // 转换为NC4HW4格式（MNN优化格式）
+        // 通过视觉编码器生成图像嵌入
         image_embedding = mul_module_->forward(image);
     }
-    auto et    = std::chrono::system_clock::now();
+    
+    auto et = std::chrono::system_clock::now();  // 结束计时
+    // 记录视觉处理耗时
     mState.vision_us_ = std::chrono::duration_cast<std::chrono::microseconds>(et - st).count();
+    
+    // 缓存图像嵌入供后续使用
     mul_embeddings_.push_back(image_embedding);
-    int visual_len = image_embedding->getInfo()->dim[0];
-    std::vector<int> img_ids(visual_len, img_pad_);
-    img_ids.insert(img_ids.begin(), vision_start_);
-    img_ids.push_back(vision_end_);
-    return img_ids;
+    
+    // 构造对应的token序列
+    int visual_len = image_embedding->getInfo()->dim[0];  // 视觉序列长度
+    std::vector<int> img_ids(visual_len, img_pad_);       // 用填充token填充序列
+    img_ids.insert(img_ids.begin(), vision_start_);       // 添加视觉开始token
+    img_ids.push_back(vision_end_);                       // 添加视觉结束token
+    
+    return img_ids;  // 返回视觉token序列
 #else
-    return std::vector<int>(0);
+    return std::vector<int>(0);  // 如果未启用视觉支持，返回空序列
 #endif
 }
 
+// 辅助模板函数：创建常量张量
 template <typename T>
 static inline VARP _var(std::vector<T> vec, const std::vector<int> &dims) {
     return _Const(vec.data(), dims, NHWC, halide_type_of<T>());
 }
 
+// 音频处理方法：将音频文件转换为token序列
+// 使用Whisper的filter bank特征提取和音频编码器
 std::vector<int> Mllm::audio_process(const std::string& file) {
 #ifdef LLM_SUPPORT_AUDIO
-    constexpr int sample_rate = 16000;
-    auto load_res        = MNN::AUDIO::load(file, sample_rate);
-    VARP waveform        = load_res.first;
-    // int sample_rate      = load_res.second;
-    int wav_len          = waveform->getInfo()->dim[0];
-    int hop_length       = 160;
-    auto st              = std::chrono::system_clock::now();
-    auto input_features  = MNN::AUDIO::whisper_fbank(waveform);
+    constexpr int sample_rate = 16000;  // 固定采样率16kHz，Whisper标准
+    
+    // 加载音频文件并重采样到指定采样率
+    auto load_res = MNN::AUDIO::load(file, sample_rate);
+    VARP waveform = load_res.first;   // 获取波形数据
+    // int sample_rate = load_res.second;  // 实际采样率（未使用）
+    
+    int wav_len = waveform->getInfo()->dim[0];  // 音频长度（采样点数）
+    int hop_length = 160;  // 跳跃长度（未使用，预留）
+    
+    auto st = std::chrono::system_clock::now();  // 开始计时
+    
+    // 提取Whisper风格的filter bank特征
+    auto input_features = MNN::AUDIO::whisper_fbank(waveform);
+    
+    // 通过音频编码器生成音频嵌入
     auto audio_embedding = mul_module_->forward(input_features);
+    
+    // 调整嵌入张量维度：从[batch, seq_len, dim]转为[seq_len, batch, dim]
     audio_embedding = _Permute(audio_embedding, {1, 0, 2});
-    auto et         = std::chrono::system_clock::now();
-    mState.audio_us_       = std::chrono::duration_cast<std::chrono::microseconds>(et - st).count();
+    
+    auto et = std::chrono::system_clock::now();  // 结束计时
+    // 记录音频处理耗时
+    mState.audio_us_ = std::chrono::duration_cast<std::chrono::microseconds>(et - st).count();
+    
+    // 缓存音频嵌入供后续使用
     mul_embeddings_.push_back(audio_embedding);
-    int embed_len = audio_embedding->getInfo()->dim[0];
-    std::vector<int> audio_ids(embed_len, audio_pad_);
-    return audio_ids;
+    
+    // 构造对应的token序列
+    int embed_len = audio_embedding->getInfo()->dim[0];  // 音频序列长度
+    std::vector<int> audio_ids(embed_len, audio_pad_);   // 用音频填充token填充序列
+    
+    return audio_ids;  // 返回音频token序列
 #else
-    return std::vector<int>(0);
+    return std::vector<int>(0);  // 如果未启用音频支持，返回空序列
 #endif
 }
 
+// 多模态处理方法：统一处理图像和音频输入
+// 支持本地文件和URL下载，以及图像尺寸参数解析
 std::vector<int> Mllm::multimode_process(const std::string& mode, std::string info) {
-    auto file_info = info;
+    auto file_info = info;  // 文件信息，可能包含路径或URL
+    
+    // 处理图像模式下的特殊格式
     if (mode == "img") {
-        std::regex hw_regex(R"(<hw>(.*?)</hw>)");
+        // 解析图像尺寸标签 <hw>height,width</hw>
+        std::regex hw_regex(R"(<hw>(.*?)</hw>)");  // 匹配 <hw>内容</hw> 格式
         std::sregex_iterator iter(info.begin(), info.end(), hw_regex);
         std::sregex_iterator end;
-        file_info = "";
+        file_info = "";  // 重置文件信息
 
         size_t currentPosition = 0;
         if (iter != end) {
             std::smatch match = *iter;
             size_t matchPosition = match.position();
+            
+            // 保留标签前的内容
             if (matchPosition > currentPosition) {
                 file_info.append(info.substr(currentPosition, matchPosition - currentPosition));
             }
 
+            // 解析尺寸参数：格式为 "height,width"
             std::stringstream hw_ss(match.str(1));
             char comma;
-            hw_ss >> image_height_ >> comma >> image_width_;
+            hw_ss >> image_height_ >> comma >> image_width_;  // 读取高度、逗号、宽度
             currentPosition = matchPosition + match.length();
         }
+        
+        // 保留标签后的内容（通常是文件路径）
         if (currentPosition < info.length()) {
             file_info.append(info.substr(currentPosition));
         }
+        
+        // 调试输出（已注释）
         // std::cout << "hw: " << image_height_ << ", " << image_width_ << std::endl;
         // std::cout << "file: " << file_info << std::endl;
     }
+    
+    // 处理HTTP/HTTPS URL：下载远程文件
     if (file_info.substr(0, 4) == "http") {
-        std::regex url_regex(R"(^https?://([^/]+)(/.*))");
+        std::regex url_regex(R"(^https?://([^/]+)(/.*))");  // 解析URL：协议://主机/路径
         std::smatch url_match_result;
         std::string host, path;
+        
+        // 提取主机名和路径
         if (std::regex_search(file_info, url_match_result, url_regex) && url_match_result.size() == 3) {
-            host = url_match_result[1].str();
-            path = url_match_result[2].str();
+            host = url_match_result[1].str();  // 主机名
+            path = url_match_result[2].str();  // 路径
         }
+        
+        // 调试输出（已注释）
         // std::cout << host << "#" << path << std::endl;
+        
+        // 使用HTTP客户端下载文件
         httplib::Client cli(host);
-        auto res  = cli.Get(path);
-        file_info = "downloaded_file";
+        auto res = cli.Get(path);
+        file_info = "downloaded_file";  // 设置本地文件名
+        
         if (res && res->status == 200) {
+            // 下载成功，保存到本地文件
             std::ofstream file(file_info, std::ios::binary);
             if (file.is_open()) {
                 file.write(res->body.c_str(), res->body.size());
@@ -1174,16 +1375,20 @@ std::vector<int> Mllm::multimode_process(const std::string& mode, std::string in
                 std::cerr << "Unable to open file to write." << std::endl;
             }
         } else {
+            // 下载失败
             std::cerr << "Failed to download file. Status code: " << (res ? res->status : 0) << std::endl;
         }
     }
+    
+    // 根据模式调用相应的处理方法
     if (mode == "img" && config_->is_visual()) {
-        return vision_process(file_info);
+        return vision_process(file_info);  // 处理图像
     }
     if (mode == "audio" && config_->is_audio()) {
-        return audio_process(file_info);
+        return audio_process(file_info);   // 处理音频
     }
-    return std::vector<int>(0);
+    
+    return std::vector<int>(0);  // 不支持的模式或配置，返回空序列
 }
 
 std::vector<int> Mllm::tokenizer_encode(const std::string& query, bool use_template) {
