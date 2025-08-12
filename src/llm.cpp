@@ -33,20 +33,30 @@
 using namespace MNN::Express;  // 使用MNN表达式命名空间
 namespace MNN {
 namespace Transformer {
-// KV缓存元数据结构，用于管理键值对缓存的状态和内存分配
+/**
+ * @brief KV缓存元数据结构，用于管理键值对缓存的状态和内存分配
+ * 
+ * 该结构体负责跟踪和管理Transformer模型中注意力机制的KV缓存状态，
+ * 包括缓存的增删改操作以及内存块的管理。
+ */
 struct KVMeta {
-    size_t block = 4096;      // 块大小，默认4096，用于内存块管理
-    size_t previous = 0;      // 之前的序列长度，记录历史token数量
-    size_t remove = 0;        // 需要移除的token数量，用于缓存清理
-    int* reserve = nullptr;   // 保留区域指针，指向需要保留的内存区域
-    int n_reserve = 0;        // 保留区域数量
-    size_t add = 0;           // 新增的token数量
-    std::vector<int> reserveHost;  // 主机端保留数据的缓存
+    size_t block = 4096;      ///< 内存块大小，默认4096字节，用于内存块管理
+    size_t previous = 0;      ///< 之前的序列长度，记录历史token数量
+    size_t remove = 0;        ///< 需要移除的token数量，用于缓存清理
+    int* reserve = nullptr;   ///< 保留区域指针，指向需要保留的内存区域
+    int n_reserve = 0;        ///< 保留区域数量
+    size_t add = 0;           ///< 新增的token数量
+    std::vector<int> reserveHost;  ///< 主机端保留数据的缓存
     
-    // 同步缓存状态，更新序列长度并重置临时变量
+    /**
+     * @brief 同步缓存状态，更新序列长度并重置临时变量
+     * 
+     * 该方法计算并更新当前KV缓存的总序列长度，考虑了移除、新增和恢复的token数量，
+     * 然后重置所有临时状态变量，为下一次操作做准备。
+     */
     void sync() {
         int revertNumber = 0;
-        // 遍历保留区域，累计需要恢复的数量
+        // 遍历保留区域，累计需要恢复的token数量
         for (int i=0; i<n_reserve; ++i) {
             revertNumber += reserve[2*i+1];  // 每个保留区域的第二个值表示恢复数量
         }
@@ -85,32 +95,65 @@ static void q81_dequant_ref(const uint8_t* src, float* dst, float scale, float z
     }
 }
 
-// 磁盘嵌入类：用于从磁盘文件中读取词向量嵌入，以节省内存使用
-// 支持量化和非量化两种存储格式，动态加载需要的嵌入向量
+/**
+ * @brief 磁盘嵌入类：用于从磁盘文件中读取词向量嵌入，以节省内存使用
+ * 
+ * 该类支持量化和非量化两种存储格式，能够动态加载需要的嵌入向量，
+ * 从而有效减少内存占用。对于大型模型，将词嵌入存储在磁盘上而不是内存中
+ * 可以显著降低内存使用量。
+ */
 class DiskEmbedding {
 public:
-    // 构造函数：根据配置文件初始化磁盘嵌入
+    /**
+     * @brief 构造函数：根据配置文件初始化磁盘嵌入
+     * 
+     * 根据配置信息判断是否使用量化存储格式，并相应地初始化文件指针、
+     * 缓冲区和反量化函数。
+     * 
+     * @param config 模型配置指针，包含嵌入层相关配置信息
+     */
     explicit DiskEmbedding(const std::shared_ptr<LlmConfig>& config);
     
-    // 析构函数：清理资源
-    ~DiskEmbedding() {
-    }
+    /**
+     * @brief 析构函数：清理资源
+     * 
+     * 使用默认析构函数，智能指针会自动释放相关资源。
+     */
+    ~DiskEmbedding() = default;
     
-    // 根据输入的token ID序列生成对应的嵌入向量
-    // input_ids: token ID序列
-    // ptr: 输出嵌入向量的指针
+    /**
+     * @brief 根据输入的token ID序列生成对应的嵌入向量
+     * 
+     * 该方法根据token ID从磁盘文件中读取对应的嵌入向量数据，
+     * 如果是量化格式则进行反量化处理，最终将结果存储到指定的内存位置。
+     * 
+     * @param input_ids token ID序列
+     * @param ptr 输出嵌入向量的指针，用于存储生成的嵌入向量
+     */
     void embedding(const std::vector<int>& input_ids, float* ptr);
 
 private:
-    // 从文件指定偏移位置读取数据到目标缓冲区
+    /**
+     * @brief 从文件指定偏移位置读取数据到目标缓冲区
+     * 
+     * 该方法将文件指针移动到指定偏移位置，并读取指定大小的数据到目标缓冲区。
+     * 
+     * @param dst 目标缓冲区指针
+     * @param size 要读取的数据大小（字节数）
+     * @param offset 文件中的偏移位置
+     */
     void seek_read(uint8_t* dst, size_t size, size_t offset);
     
-    std::unique_ptr<uint8_t[]> alpha_;   // 量化参数缓冲区（缩放因子和零点）
-    std::unique_ptr<uint8_t[]> weight_;  // 权重数据缓冲区
-    std::unique_ptr<FILE, decltype(&fclose)> fp_;  // 文件指针，用RAII管理
-    DequantFunction dequant_;            // 反量化函数指针
-    int hidden_size_, weight_token_size_; // 隐藏层维度和每个token权重大小
-    int64_t w_offset_, block_num_, quant_block_, quant_bit_; // 文件偏移、块数量、量化块大小、量化位数
+    std::unique_ptr<uint8_t[]> alpha_;   ///< 量化参数缓冲区（缩放因子和零点）
+    std::unique_ptr<uint8_t[]> weight_;  ///< 权重数据缓冲区
+    std::unique_ptr<FILE, decltype(&fclose)> fp_;  ///< 文件指针，用RAII管理
+    DequantFunction dequant_;            ///< 反量化函数指针
+    int hidden_size_;                    ///< 隐藏层维度（嵌入向量维度）
+    int weight_token_size_;              ///< 每个token权重大小（字节数）
+    int64_t w_offset_;                   ///< 权重在文件中的偏移位置
+    int64_t block_num_;                  ///< 块数量（用于量化）
+    int64_t quant_block_;                ///< 量化块大小
+    int64_t quant_bit_;                  ///< 量化位数（4位或8位）
 };
 
 // 从文件指定偏移位置读取数据到目标缓冲区
@@ -184,11 +227,22 @@ void DiskEmbedding::embedding(const std::vector<int>& input_ids, float* dst) {
     }
 }
 
-// 多模态大语言模型类：继承自Llm，支持视觉和音频输入处理
-// 能够处理图像和音频数据，将其转换为token序列并与文本一起输入模型
+/**
+ * @brief 多模态大语言模型类：继承自Llm，支持视觉和音频输入处理
+ * 
+ * 该类扩展了基础的Llm类，增加了对图像和音频数据的处理能力。
+ * 能够将图像和音频数据转换为token序列，并与文本一起输入模型进行多模态推理。
+ */
 class Mllm : public Llm {
 public:
-    // 构造函数：初始化多模态LLM，配置视觉和音频参数
+    /**
+     * @brief 构造函数：初始化多模态LLM，配置视觉和音频参数
+     * 
+     * 根据配置文件初始化多模态LLM的相关参数，包括视觉和音频处理所需的配置。
+     * 如果配置启用了视觉或音频功能，则相应地设置处理参数。
+     * 
+     * @param config 模型配置指针，包含多模态相关的配置信息
+     */
     Mllm(std::shared_ptr<LlmConfig> config) : Llm(config) {
         if (config->is_visual()) {
             // 配置视觉相关参数
@@ -205,44 +259,109 @@ public:
         }
     }
     
-    // 析构函数：清理多模态模块资源
+    /**
+     * @brief 析构函数：清理多模态模块资源
+     * 
+     * 释放多模态处理模块的资源，确保正确清理内存。
+     */
     ~Mllm() {
         mul_module_.reset();  // 释放多模态模块
     }
     
-    // 重写基类方法：加载多模态模型
+    /**
+     * @brief 重写基类方法：加载多模态模型
+     * 
+     * 该方法扩展了基类的加载功能，除了加载基础的LLM模型外，
+     * 还会加载多模态处理模块（如视觉编码器或音频编码器）。
+     */
     virtual void load() override;
     
-    // 重写基类方法：支持多模态内容的token编码
+    /**
+     * @brief 重写基类方法：支持多模态内容的token编码
+     * 
+     * 该方法扩展了基类的token编码功能，能够处理包含图像或音频标记的文本，
+     * 将这些标记转换为对应的token序列。
+     * 
+     * @param query 输入的查询字符串，可能包含多模态标记
+     * @param use_template 是否使用提示词模板，默认为true
+     * @return 编码后的token ID序列
+     */
     virtual std::vector<int> tokenizer_encode(const std::string& query, bool use_template = true) override;
     
-    // 重写基类方法：生成包含多模态内容的嵌入向量
+    /**
+     * @brief 重写基类方法：生成包含多模态内容的嵌入向量
+     * 
+     * 该方法扩展了基类的嵌入生成功能，能够处理包含多模态内容的token序列，
+     * 将文本token和多模态token（图像或音频）一起转换为嵌入向量。
+     * 
+     * @param input_ids 输入的token ID序列，可能包含多模态token
+     * @return 生成的嵌入向量
+     */
     virtual MNN::Express::VARP embedding(const std::vector<int>& input_ids) override;
 
 private:
     // 视觉配置参数
-    int image_height_ = 448, image_width_ = 448;                                    // 输入图像尺寸
-    int vision_start_ = 151857, vision_end_ = 151858, img_pad_ = 151859;           // 视觉相关的特殊token ID
-    std::vector<float> image_mean_{122.7709383, 116.7460125, 104.09373615};       // RGB图像均值
-    std::vector<float> image_norm_{0.01459843, 0.01500777, 0.01422007};           // RGB图像标准差
+    int image_height_ = 448;                                       ///< 输入图像高度
+    int image_width_ = 448;                                        ///< 输入图像宽度
+    int vision_start_ = 151857;                                    ///< 视觉序列开始token ID
+    int vision_end_ = 151858;                                      ///< 视觉序列结束token ID
+    int img_pad_ = 151859;                                         ///< 图像填充token ID
+    std::vector<float> image_mean_{122.7709383, 116.7460125, 104.09373615}; ///< RGB图像均值，用于归一化
+    std::vector<float> image_norm_{0.01459843, 0.01500777, 0.01422007};     ///< RGB图像标准差，用于归一化
     
     // 音频配置参数
-    int audio_pad_ = 151646;  // 音频填充token ID
+    int audio_pad_ = 151646;  ///< 音频填充token ID
     
     // 私有方法声明
-    std::vector<int> multimode_process(const std::string& mode, std::string info);  // 多模态数据处理
-    std::vector<int> vision_process(const std::string& file);                       // 视觉数据处理
-    std::vector<int> audio_process(const std::string& file);                        // 音频数据处理
+    /**
+     * @brief 多模态数据处理
+     * 
+     * 根据指定的模式（图像或音频）和文件信息，处理多模态数据并生成对应的token序列。
+     * 
+     * @param mode 处理模式，"img"表示图像，"audio"表示音频
+     * @param info 文件信息，可能包含文件路径或URL
+     * @return 处理后的token ID序列
+     */
+    std::vector<int> multimode_process(const std::string& mode, std::string info);
+    
+    /**
+     * @brief 视觉数据处理
+     * 
+     * 处理图像文件，将其转换为token序列。支持多种视觉模型架构，
+     * 包括标准模型和Qwen2-VL等。
+     * 
+     * @param file 图像文件路径
+     * @return 图像对应的token ID序列
+     */
+    std::vector<int> vision_process(const std::string& file);
+    
+    /**
+     * @brief 音频数据处理
+     * 
+     * 处理音频文件，将其转换为token序列。使用Whisper的filter bank特征提取和音频编码器。
+     * 
+     * @param file 音频文件路径
+     * @return 音频对应的token ID序列
+     */
+    std::vector<int> audio_process(const std::string& file);
     
     // 多模态模块和嵌入缓存
-    std::shared_ptr<Module> mul_module_;   // 多模态处理模块（视觉或音频编码器）
-    std::vector<VARP> mul_embeddings_;     // 多模态嵌入向量缓存
+    std::shared_ptr<Module> mul_module_;   ///< 多模态处理模块（视觉或音频编码器）
+    std::vector<VARP> mul_embeddings_;     ///< 多模态嵌入向量缓存
 };
 
 // === Llm 类实现开始 ===
 
-// 静态工厂方法：根据配置文件路径创建LLM实例
-// 自动判断是否需要多模态支持，返回对应的LLM或Mllm实例
+/**
+ * @brief 静态工厂方法：根据配置文件路径创建LLM实例
+ * 
+ * 该方法是一个静态工厂方法，用于根据配置文件路径创建相应的LLM实例。
+ * 自动判断是否需要多模态支持，如果配置启用了视觉或音频功能，
+ * 则返回Mllm实例，否则返回标准的Llm实例。
+ * 
+ * @param config_path 配置文件路径
+ * @return 创建的LLM实例指针
+ */
 Llm* Llm::createLLM(const std::string& config_path) {
     std::shared_ptr<LlmConfig> config(new LlmConfig(config_path));  // 解析配置文件
     Llm* llm = nullptr;
@@ -256,7 +375,15 @@ Llm* Llm::createLLM(const std::string& config_path) {
     return llm;
 }
 
-// 后端类型转换函数：将字符串类型转换为MNN后端枚举
+/**
+ * @brief 后端类型转换函数：将字符串类型转换为MNN后端枚举
+ * 
+ * 该函数将表示后端类型的字符串转换为MNN的后端类型枚举值。
+ * 支持多种后端类型，包括CPU、GPU和专用硬件加速器。
+ * 
+ * @param type_str 后端类型字符串
+ * @return 对应的MNN后端类型枚举值
+ */
 static MNNForwardType backend_type_convert(const std::string& type_str) {
     if (type_str == "cpu")        return MNN_FORWARD_CPU;      // CPU后端
     if (type_str == "metal")      return MNN_FORWARD_METAL;    // Metal后端（iOS/macOS GPU）
@@ -268,17 +395,40 @@ static MNNForwardType backend_type_convert(const std::string& type_str) {
     return MNN_FORWARD_AUTO;      // 自动选择后端
 }
 
-// 导出配置信息为JSON字符串
+/**
+ * @brief 导出配置信息为JSON字符串
+ * 
+ * 该方法将当前模型的配置信息导出为JSON格式的字符串，
+ * 便于查看和保存模型的配置状态。
+ * 
+ * @return JSON格式的配置信息字符串
+ */
 std::string Llm::dump_config() {
     return config_->config_.dump();
 }
 
-// 设置配置信息：合并新的JSON配置
+/**
+ * @brief 设置配置信息：合并新的JSON配置
+ * 
+ * 该方法用于合并新的JSON配置信息到当前配置中，
+ * 可以动态更新模型的配置参数。
+ * 
+ * @param content JSON格式的配置信息字符串
+ * @return 设置成功返回true，否则返回false
+ */
 bool Llm::set_config(const std::string& content) {
     return config_->config_.merge(content.c_str());
 }
 
-// 获取文件大小（以MB为单位）
+/**
+ * @brief 获取文件大小（以MB为单位）
+ * 
+ * 该函数用于获取指定文件的大小，并以MB为单位返回。
+ * 主要用于计算模型文件的大小，为内存映射等操作提供参考。
+ * 
+ * @param filename 文件路径
+ * @return 文件大小（MB），获取失败返回-1
+ */
 int file_size_m(const std::string& filename) {
     std::ifstream file(filename, std::ios::binary | std::ios::ate);  // 打开文件并移到末尾
     if (!file.is_open()) {
@@ -290,7 +440,13 @@ int file_size_m(const std::string& filename) {
     return fileSize / (1024 * 1024);    // 转换为MB
 }
 
-// 初始化运行时环境：配置MNN执行器和各种优化选项
+/**
+ * @brief 初始化运行时环境：配置MNN执行器和各种优化选项
+ * 
+ * 该方法用于初始化模型运行时环境，配置MNN执行器的各种参数和优化选项。
+ * 包括后端类型、线程数、功耗模式、内存使用策略、精度模式等，
+ * 以及各种运行时优化选项如量化、内存映射等。
+ */
 void Llm::init_runtime() {
     // 配置调度和后端参数
     ScheduleConfig config;
@@ -371,6 +527,12 @@ void Llm::init_runtime() {
     }
 }
 
+/**
+ * @brief 加载模型权重和相关组件
+ * 
+ * 该方法用于加载模型的所有必要组件，包括运行时环境、分词器、磁盘嵌入和模型权重。
+ * 同时会创建用于prefill和decode阶段的模块副本，以优化不同阶段的推理性能。
+ */
 void Llm::load() {
     init_runtime();
     // init module status
@@ -410,6 +572,15 @@ void Llm::load() {
     prefill_modules_ = modules_;
 }
 
+/**
+ * @brief 应用LoRA权重
+ * 
+ * 该方法用于加载并应用LoRA（Low-Rank Adaptation）权重到模型中。
+ * LoRA是一种高效的微调技术，通过低秩矩阵分解来减少参数量。
+ * 
+ * @param lora_path LoRA权重文件路径
+ * @return LoRA模块在模块列表中的索引
+ */
 size_t Llm::apply_lora(const std::string& lora_path) {
     std::string model_path = config_->base_dir_ + "/" + lora_path;
     Module::Config module_config;
@@ -423,6 +594,15 @@ size_t Llm::apply_lora(const std::string& lora_path) {
     return lora_index;
 }
 
+/**
+ * @brief 创建LoRA模型实例
+ * 
+ * 该方法用于创建一个新的LoRA模型实例，该实例基于当前模型的配置，
+ * 但使用指定的LoRA权重文件。
+ * 
+ * @param lora_path LoRA权重文件路径
+ * @return 新创建的LoRA模型实例指针
+ */
 Llm* Llm::create_lora(const std::string& lora_path) {
     auto llm = new Llm(config_);
     llm->set_config("{\"llm_model\": \"" + lora_path + "\"}");
@@ -431,6 +611,15 @@ Llm* Llm::create_lora(const std::string& lora_path) {
     return llm;
 }
 
+/**
+ * @brief 释放指定索引的模块
+ * 
+ * 该方法用于释放指定索引的模型模块，释放其占用的资源。
+ * 如果要释放的模块是当前prefill模块，则会切换回默认模块。
+ * 
+ * @param index 要释放的模块索引
+ * @return 释放成功返回true，否则返回false
+ */
 bool Llm::release_module(size_t index) {
     if (index >= modules_.size()) {
         return false;
@@ -442,6 +631,15 @@ bool Llm::release_module(size_t index) {
     return true;
 }
 
+/**
+ * @brief 选择指定索引的模块作为当前模块
+ * 
+ * 该方法用于选择指定索引的模型模块作为当前使用的模块，
+ * 并更新prefill和decode阶段使用的模块。
+ * 
+ * @param index 要选择的模块索引
+ * @return 选择成功返回true，否则返回false
+ */
 bool Llm::select_module(size_t index) {
     if (index >= modules_.size()) {
         return false;
@@ -458,6 +656,14 @@ bool Llm::select_module(size_t index) {
     return true;
 }
 
+/**
+ * @brief 开启或关闭性能追踪
+ * 
+ * 该方法用于开启或关闭模型推理的性能追踪功能。
+ * 当开启时，会收集模型推理过程中的性能数据用于分析和优化。
+ * 
+ * @param start true表示开启追踪，false表示关闭追踪
+ */
 void Llm::trace(bool start) {
     auto status = MNN::Interpreter::Session_Resize_Check;
     if (start) {
@@ -473,6 +679,15 @@ void Llm::trace(bool start) {
     mTracing = start;
 }
 
+/**
+ * @brief 微调模型参数以优化性能
+ * 
+ * 该方法用于微调模型的特定参数以优化推理性能。
+ * 目前主要支持优化Metal后端的OP编码器数量参数。
+ * 
+ * @param type 微调参数类型
+ * @param candidates 候选参数值列表
+ */
 void Llm::tuning(TuneType type, std::vector<int> candidates) {
     if (type != OP_ENCODER_NUMBER) {
         MNN_ERROR("tuning type not supported\n");
@@ -507,6 +722,14 @@ void Llm::tuning(TuneType type, std::vector<int> candidates) {
     }
     runtime_manager_->setHint(MNN::Interpreter::OP_ENCODER_NUMBER_FOR_COMMIT, prefer_candidate);
 }
+/**
+ * @brief 切换模型推理阶段
+ * 
+ * 该方法用于在Prefill阶段和Decode阶段之间切换模型模块。
+ * Prefill阶段处理完整的输入序列，Decode阶段逐个生成输出token。
+ * 
+ * @param stage 目标推理阶段（Prefill或Decode）
+ */
 void Llm::switchMode(Llm::Stage stage) {
     switch (stage) {
         case Prefill:
@@ -520,6 +743,17 @@ void Llm::switchMode(Llm::Stage stage) {
     }
 }
 
+/**
+ * @brief 原始前向推理接口
+ * 
+ * 该方法是模型前向推理的核心接口，接收隐藏状态、注意力掩码和位置信息作为输入，
+ * 通过当前模块进行推理计算，返回logits输出。
+ * 
+ * @param hiddenState 隐藏状态输入张量
+ * @param mask 注意力掩码张量
+ * @param inputPos 输入位置信息张量
+ * @return 推理结果logits张量，推理失败返回nullptr
+ */
 MNN::Express::VARP Llm::forwardRaw(MNN::Express::VARP hiddenState, MNN::Express::VARP mask, MNN::Express::VARP inputPos) {
     VARP logits;
     std::vector<MNN::Express::VARP> outputs;
@@ -531,6 +765,16 @@ MNN::Express::VARP Llm::forwardRaw(MNN::Express::VARP hiddenState, MNN::Express:
     return logits;
 }
 
+/**
+ * @brief 前向推理接口
+ * 
+ * 该方法是模型前向推理的高级接口，接收token ID序列作为输入，
+ * 自动处理嵌入生成、注意力掩码和位置ID生成等步骤，
+ * 调用原始前向推理接口完成推理计算。
+ * 
+ * @param input_ids 输入的token ID序列
+ * @return 推理结果logits张量，推理失败返回nullptr
+ */
 VARP Llm::forward(const std::vector<int>& input_ids) {
     int seq_len         = input_ids.size();
     auto attention_mask = gen_attention_mask(seq_len);
@@ -542,8 +786,19 @@ VARP Llm::forward(const std::vector<int>& input_ids) {
     return logits;
 }
 
-// 采样方法：从logits中选择下一个token
-// 使用贪心策略（argmax）并应用重复惩罚来提高生成质量
+/**
+ * @brief 采样方法：从logits中选择下一个token
+ * 
+ * 该方法用于从模型输出的logits中采样下一个token。
+ * 使用贪心策略（argmax）并应用重复惩罚来提高生成质量，
+ * 避免生成重复的内容。
+ * 
+ * @param logits 模型输出的logits张量
+ * @param pre_ids 历史生成的token ID序列
+ * @param offset 采样起始偏移位置
+ * @param size 采样范围大小
+ * @return 采样得到的token ID
+ */
 int Llm::sample(VARP logits, const std::vector<int>& pre_ids, int offset, int size) {
     std::unordered_set<int> ids_set(pre_ids.begin(), pre_ids.end());  // 将历史token转为集合，用于快速查找
     auto scores = (float*)(logits->readMap<float>()) + offset;        // 获取logits分数指针
@@ -575,6 +830,17 @@ int Llm::sample(VARP logits, const std::vector<int>& pre_ids, int offset, int si
     return token_id;  // 返回选中的token ID
 }
 
+/**
+ * @brief 应用模板生成提示词
+ * 
+ * 该函数用于将内容和角色信息应用到提示词模板中，
+ * 生成符合模型要求的输入格式。
+ * 
+ * @param prompt_template 提示词模板字符串
+ * @param content 要插入模板的内容
+ * @param role 角色信息（可选）
+ * @return 应用模板后生成的字符串
+ */
 static std::string apply_template(std::string prompt_template, const std::string& content,
                                   const std::string& role = "") {
     if (prompt_template.empty())
@@ -594,11 +860,29 @@ static std::string apply_template(std::string prompt_template, const std::string
     return prompt_template;
 }
 
+/**
+ * @brief 应用提示词模板
+ * 
+ * 该方法用于将用户输入内容应用到配置的提示词模板中，
+ * 生成符合模型要求的输入格式。
+ * 
+ * @param user_content 用户输入的内容
+ * @return 应用模板后生成的提示词字符串
+ */
 std::string Llm::apply_prompt_template(const std::string& user_content) const {
     auto chat_prompt = config_->prompt_template();
     return apply_template(chat_prompt, user_content);
 }
 
+/**
+ * @brief 应用聊天模板
+ * 
+ * 该方法用于将聊天历史记录应用到配置的聊天模板中，
+ * 生成符合模型要求的多轮对话输入格式。
+ * 
+ * @param chat_prompts 聊天历史记录，包含角色和内容的pair序列
+ * @return 应用模板后生成的聊天提示词字符串
+ */
 std::string Llm::apply_chat_template(const std::vector<PromptItem>& chat_prompts) const {
     auto chat_template = config_->chat_template();
     std::string prompt_result;
@@ -614,6 +898,12 @@ std::string Llm::apply_chat_template(const std::vector<PromptItem>& chat_prompts
     return prompt_result;
 }
 
+/**
+ * @brief 启动聊天交互
+ * 
+ * 该方法用于启动一个交互式的聊天会话，用户可以通过命令行与模型进行多轮对话。
+ * 支持 /exit 命令退出聊天，/reset 命令重置对话历史。
+ */
 void Llm::chat() {
     std::vector<PromptItem> history;
     history.push_back(std::make_pair("system", "You are a helpful assistant."));
@@ -649,11 +939,26 @@ void Llm::chat() {
     }
 }
 
+/**
+ * @brief 重置模型状态
+ * 
+ * 该方法用于重置模型的内部状态，清空历史记录和序列长度计数器，
+ * 使模型回到初始状态。
+ */
 void Llm::reset() {
     mState.history_ids_.clear();
     mState.all_seq_len_ = 0;
 }
 
+/**
+ * @brief 初始化生成过程
+ * 
+ * 该方法用于初始化文本生成过程的各种状态变量，
+ * 包括输出流、计数器、计时器等，并根据配置决定是否重用KV缓存。
+ * 
+ * @param os 输出流指针，默认为nullptr
+ * @param end_with 结束标记字符串，默认为nullptr
+ */
 void Llm::generate_init(std::ostream* os, const char* end_with) {
     // init status
     mState.os_ = os;
@@ -674,9 +979,26 @@ void Llm::generate_init(std::ostream* os, const char* end_with) {
     mState.output_ids_.clear();
     current_modules_ = prefill_modules_;
 }
+/**
+ * @brief 获取当前历史记录长度
+ * 
+ * 该方法用于获取当前KV缓存中保存的历史记录长度。
+ * 
+ * @return 当前历史记录长度
+ */
 size_t Llm::getCurrentHistory() const {
     return mMeta->previous;
 }
+
+/**
+ * @brief 删除指定范围的历史记录
+ * 
+ * 该方法用于删除KV缓存中指定范围的历史记录，
+ * 以控制缓存大小和处理长序列。
+ * 
+ * @param begin 删除起始位置
+ * @param end 删除结束位置，默认为0表示删除到末尾
+ */
 void Llm::eraseHistory(size_t begin, size_t end) {
     if (0 == end) {
         end = mMeta->previous;
@@ -698,13 +1020,26 @@ void Llm::eraseHistory(size_t begin, size_t end) {
     }
 }
 
-// 检查是否应该停止生成（遇到停止token）
+/**
+ * @brief 检查是否应该停止生成
+ * 
+ * 该方法用于检查当前生成的token是否为停止token，
+ * 如果是则返回true，表示应该停止生成。
+ * 
+ * @return 如果应该停止生成返回true，否则返回false
+ */
 bool Llm::stoped() {
     return is_stop(mState.current_token_);
 }
 
-// 增量生成方法：逐个生成token直到达到最大数量或遇到停止条件
-// 这是解码阶段的核心循环，每次生成一个新token
+/**
+ * @brief 增量生成方法：逐个生成token直到达到最大数量或遇到停止条件
+ * 
+ * 该方法是解码阶段的核心循环，每次生成一个新token，直到达到指定的最大token数量
+ * 或遇到停止条件。在生成过程中会实时输出结果并更新内部状态。
+ * 
+ * @param max_token 最大生成token数量
+ */
 void Llm::generate(int max_token) {
     int len = 0;  // 已生成的token数量计数器
     
@@ -750,8 +1085,16 @@ void Llm::generate(int max_token) {
     }
 }
 
-// 完整生成方法：给定输入token序列，生成指定数量的新token
-// 这是LLM生成的主要入口，包含预填充（prefill）和解码（decode）两个阶段
+/**
+ * @brief 完整生成方法：给定输入token序列，生成指定数量的新token
+ * 
+ * 该方法是LLM文本生成的主要入口，包含预填充（prefill）和解码（decode）两个阶段。
+ * 预填充阶段处理整个输入序列，解码阶段逐个生成新token。
+ * 
+ * @param input_ids 输入的token ID序列
+ * @param max_tokens 最大生成token数量，负数表示使用配置默认值
+ * @return 生成的token ID序列
+ */
 std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens) {
     if (max_tokens < 0) {
         max_tokens = config_->max_new_tokens();  // 使用配置文件中的默认最大token数
@@ -796,6 +1139,16 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
     return mState.output_ids_;  // 返回生成的token序列
 }
 
+/**
+ * @brief 将文本编码为token ID序列
+ * 
+ * 该方法用于将用户输入的文本内容编码为token ID序列，
+ * 可选择是否应用提示词模板。
+ * 
+ * @param user_content 用户输入的文本内容
+ * @param use_template 是否应用提示词模板，默认为true
+ * @return 编码后的token ID序列
+ */
 std::vector<int> Llm::tokenizer_encode(const std::string& user_content, bool use_template) {
     if (!use_template) {
         return tokenizer_->encode(user_content);
@@ -805,6 +1158,17 @@ std::vector<int> Llm::tokenizer_encode(const std::string& user_content, bool use
     return input_ids;
 }
 
+/**
+ * @brief 对用户输入进行响应
+ * 
+ * 该方法用于对用户输入的文本内容进行响应，生成相应的回复文本。
+ * 会自动处理文本编码、模型推理和文本生成等过程。
+ * 
+ * @param user_content 用户输入的文本内容
+ * @param os 输出流指针，默认为标准输出
+ * @param end_with 结束标记字符串，默认为换行符
+ * @param max_new_tokens 最大生成token数量，默认为-1表示使用配置默认值
+ */
 void Llm::response(const std::string& user_content, std::ostream* os, const char* end_with, int max_new_tokens) {
     if (!end_with) {
         end_with = "\n";
@@ -815,6 +1179,17 @@ void Llm::response(const std::string& user_content, std::ostream* os, const char
     generate(input_ids, max_new_tokens);
 }
 
+/**
+ * @brief 对聊天历史进行响应
+ * 
+ * 该方法用于对聊天历史记录进行响应，生成相应的回复文本。
+ * 会自动应用聊天模板并调用单次响应方法。
+ * 
+ * @param chat_prompts 聊天历史记录
+ * @param os 输出流指针，默认为标准输出
+ * @param end_with 结束标记字符串，默认为nullptr
+ * @param max_new_tokens 最大生成token数量，默认为-1表示使用配置默认值
+ */
 void Llm::response(const std::vector<PromptItem>& chat_prompts, std::ostream* os, const char* end_with, int max_new_tokens) {
     if (chat_prompts.empty()) {
         return;
@@ -823,10 +1198,23 @@ void Llm::response(const std::vector<PromptItem>& chat_prompts, std::ostream* os
     response(prompt, os, end_with, max_new_tokens);
 }
 
+/**
+ * @brief Llm类构造函数
+ * 
+ * 该构造函数用于初始化Llm对象，设置模型配置并创建KV缓存元数据。
+ * 
+ * @param config 模型配置指针
+ */
 Llm::Llm(std::shared_ptr<LlmConfig> config) : config_(config) {
     mMeta.reset(new KVMeta);
 }
 
+/**
+ * @brief Llm类析构函数
+ * 
+ * 该析构函数用于清理Llm对象占用的资源，包括模块、运行时管理器等。
+ * 如果启用了调试模式，还会打印性能统计信息。
+ */
 Llm::~Llm() {
 #if DEBUG_MODE == 1
     if (nullptr != gTimeTraceInfo) {
@@ -859,6 +1247,12 @@ Llm::~Llm() {
     runtime_manager_.reset();
 }
 
+/**
+ * @brief 打印推理速度统计信息
+ * 
+ * 该方法用于打印模型推理过程中的各种性能统计数据，
+ * 包括各阶段耗时、处理速度等信息。
+ */
 void Llm::print_speed() {
     auto vision_s   = mState.vision_us_ * 1e-6;
     auto audio_s   = mState.audio_us_ * 1e-6;
@@ -885,6 +1279,16 @@ void Llm::print_speed() {
     printf("##################################\n");
 }
 
+/**
+ * @brief 判断是否需要创建新的变量张量
+ * 
+ * 该函数用于判断是否需要创建新的变量张量，根据张量是否为空或维度是否匹配来决定。
+ * 
+ * @param var 变量张量指针
+ * @param axis 需要检查的维度索引
+ * @param seq_len 序列长度
+ * @return 如果需要创建新变量返回true，否则返回false
+ */
 static inline bool needNewVar(VARP var, int axis, int seq_len) {
     if (var == nullptr) {
         return true;
@@ -895,6 +1299,14 @@ static inline bool needNewVar(VARP var, int axis, int seq_len) {
     return false;
 }
 
+/**
+ * @brief 根据输入的token ID序列生成对应的嵌入向量
+ * 
+ * 该方法用于将输入的token ID序列转换为嵌入向量，使用磁盘嵌入技术以节省内存。
+ * 
+ * @param input_ids 输入的token ID序列
+ * @return 生成的嵌入向量张量
+ */
 VARP Llm::embedding(const std::vector<int>& input_ids) {
     AUTOTIME;
     int hidden_size = config_->hidden_size();
@@ -905,6 +1317,14 @@ VARP Llm::embedding(const std::vector<int>& input_ids) {
     return res;
 }
 
+/**
+ * @brief 将token ID解码为对应的文本
+ * 
+ * 该方法用于将token ID解码为对应的文本，并处理UTF-8编码的特殊情况。
+ * 
+ * @param id 要解码的token ID
+ * @return 解码后的文本
+ */
 std::string Llm::tokenizer_decode(int id) {
     std::string word = tokenizer_->decode(id);
     // Fix utf-8 garbled characters
@@ -915,6 +1335,14 @@ std::string Llm::tokenizer_decode(int id) {
     return word;
 }
 
+/**
+ * @brief 生成注意力掩码
+ * 
+ * 该方法用于生成注意力机制所需的掩码张量，支持多种掩码类型和数据格式。
+ * 
+ * @param seq_len 序列长度
+ * @return 生成的注意力掩码张量
+ */
 VARP Llm::gen_attention_mask(int seq_len) {
     int kv_seq_len = mState.all_seq_len_ + seq_len;
     if (seq_len == 1) {
@@ -964,6 +1392,14 @@ VARP Llm::gen_attention_mask(int seq_len) {
     }
 }
 
+/**
+ * @brief 生成位置ID
+ * 
+ * 该方法用于生成位置编码所需的位置ID张量，支持多种位置编码格式。
+ * 
+ * @param seq_len 序列长度
+ * @return 生成的位置ID张量
+ */
 VARP Llm::gen_position_ids(int seq_len) {
     if (config_->attention_mask() == "glm") {
         // chatglm
@@ -1000,10 +1436,24 @@ VARP Llm::gen_position_ids(int seq_len) {
     }
 }
 
+/**
+ * @brief 判断token ID是否为停止符
+ * 
+ * 该方法用于判断指定的token ID是否为模型定义的停止符。
+ * 
+ * @param token_id 要判断的token ID
+ * @return 如果是停止符返回true，否则返回false
+ */
 bool Llm::is_stop(int token_id) {
     return tokenizer_->is_stop(token_id);
 }
 
+/**
+ * @brief 加载多模态模型
+ * 
+ * 该方法用于加载多模态模型，包括基础的LLM模型和多模态处理模块（视觉或音频）。
+ * 会根据配置初始化运行时环境和相应的处理模块。
+ */
 void Mllm::load() {
     Llm::load();
     if (config_->mllm_config_.empty()) {
@@ -1391,6 +1841,16 @@ std::vector<int> Mllm::multimode_process(const std::string& mode, std::string in
     return std::vector<int>(0);  // 不支持的模式或配置，返回空序列
 }
 
+/**
+ * @brief 支持多模态内容的token编码
+ * 
+ * 该方法重写了基类的token编码方法，支持处理包含图像或音频标记的文本，
+ * 能够识别并处理多模态标记，生成对应的token序列。
+ * 
+ * @param query 输入的查询字符串，可能包含多模态标记
+ * @param use_template 是否使用提示词模板，默认为true
+ * @return 编码后的token ID序列
+ */
 std::vector<int> Mllm::tokenizer_encode(const std::string& query, bool use_template) {
     auto prompt = apply_prompt_template(query);
     // split query
@@ -1416,6 +1876,15 @@ std::vector<int> Mllm::tokenizer_encode(const std::string& query, bool use_templ
     return ids;
 }
 
+/**
+ * @brief 生成包含多模态内容的嵌入向量
+ * 
+ * 该方法重写了基类的嵌入生成方法，支持处理包含多模态内容的token序列，
+ * 能够将文本token和多模态token（图像或音频）一起转换为嵌入向量。
+ * 
+ * @param input_ids 输入的token ID序列，可能包含多模态token
+ * @return 生成的嵌入向量张量
+ */
 VARP Mllm::embedding(const std::vector<int>& input_ids) {
     if (input_ids.size() == 1) {
         return Llm::embedding(input_ids);
@@ -1467,12 +1936,30 @@ VARP Mllm::embedding(const std::vector<int>& input_ids) {
 // Llm end
 
 // Embedding start
+/**
+ * @brief 计算两个嵌入向量之间的欧几里得距离
+ * 
+ * 该方法用于计算两个嵌入向量之间的欧几里得距离，常用于相似度计算。
+ * 
+ * @param var0 第一个嵌入向量
+ * @param var1 第二个嵌入向量
+ * @return 两个向量之间的欧几里得距离
+ */
 float Embedding::dist(VARP var0, VARP var1) {
     auto distVar = _Sqrt(_ReduceSum(_Square(var0 - var1)));
     auto dist    = distVar->readMap<float>()[0];
     return dist;
 }
 
+/**
+ * @brief 创建嵌入模型实例
+ * 
+ * 该方法用于创建嵌入模型实例，根据配置文件路径初始化模型。
+ * 
+ * @param config_path 配置文件路径
+ * @param load 是否加载模型权重，默认为true
+ * @return 创建的嵌入模型实例指针
+ */
 Embedding* Embedding::createEmbedding(const std::string& config_path, bool load) {
     std::shared_ptr<LlmConfig> config(new LlmConfig(config_path));
     Embedding* embedding = new Embedding(config);
@@ -1482,13 +1969,32 @@ Embedding* Embedding::createEmbedding(const std::string& config_path, bool load)
     return embedding;
 }
 
+/**
+ * @brief Embedding类构造函数
+ * 
+ * 该构造函数用于初始化嵌入模型对象。
+ * 
+ * @param config 模型配置指针
+ */
 Embedding::Embedding(std::shared_ptr<LlmConfig> config) : Llm(config) {
 }
 
+/**
+ * @brief 获取嵌入维度
+ * 
+ * 该方法用于获取嵌入向量的维度大小。
+ * 
+ * @return 嵌入向量的维度
+ */
 int Embedding::dim() const {
     return config_->hidden_size();
 }
 
+/**
+ * @brief 加载嵌入模型
+ * 
+ * 该方法用于加载嵌入模型的所有必要组件，包括运行时环境、分词器、磁盘嵌入和模型权重。
+ */
 void Embedding::load() {
     init_runtime();
     printf("load tokenizer\n");
@@ -1509,6 +2015,15 @@ void Embedding::load() {
     MNN_PRINT("Done!\n");
 }
 
+/**
+ * @brief 根据token ID序列计算嵌入向量
+ * 
+ * 该方法用于根据输入的token ID序列计算对应的嵌入向量，
+ * 通过模型前向推理获得句子级别的嵌入表示。
+ * 
+ * @param ids 输入的token ID序列
+ * @return 计算得到的嵌入向量张量
+ */
 VARP Embedding::ids_embedding(const std::vector<int>& ids) {
     int prompt_len           = ids.size();
     auto inputs_ids          = embedding(ids);
@@ -1519,10 +2034,28 @@ VARP Embedding::ids_embedding(const std::vector<int>& ids) {
     return sentence_embeddings;
 }
 
+/**
+ * @brief 根据文本计算嵌入向量
+ * 
+ * 该方法用于根据输入的文本计算对应的嵌入向量，
+ * 先将文本编码为token ID序列，再计算嵌入向量。
+ * 
+ * @param txt 输入的文本
+ * @return 计算得到的嵌入向量张量
+ */
 VARP Embedding::txt_embedding(const std::string& txt) {
     return ids_embedding(tokenizer_encode(txt));
 }
 
+/**
+ * @brief 生成嵌入计算用的注意力掩码
+ * 
+ * 该方法用于生成嵌入计算所需的注意力掩码张量，
+ * 与LLM类中的同名方法不同，这里生成的是全1掩码。
+ * 
+ * @param seq_len 序列长度
+ * @return 生成的注意力掩码张量
+ */
 VARP Embedding::gen_attention_mask(int seq_len) {
     auto attention_mask = _Input({1, 1, 1, seq_len}, NCHW, halide_type_of<int>());
     auto ptr            = attention_mask->writeMap<int>();
@@ -1532,6 +2065,15 @@ VARP Embedding::gen_attention_mask(int seq_len) {
     return attention_mask;
 }
 
+/**
+ * @brief 生成嵌入计算用的位置ID
+ * 
+ * 该方法用于生成嵌入计算所需的位置ID张量，
+ * 与LLM类中的同名方法不同，这里生成的是简单的递增序列。
+ * 
+ * @param seq_len 序列长度
+ * @return 生成的位置ID张量
+ */
 VARP Embedding::gen_position_ids(int seq_len) {
     auto position_ids = _Input({1, seq_len}, NCHW, halide_type_of<int>());
     auto ptr          = position_ids->writeMap<int>();
