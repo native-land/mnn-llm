@@ -19,6 +19,7 @@
 #include "llm.hpp"                        // LLM主类定义
 #include "llmconfig.hpp"                  // LLM配置管理类
 #include "tokenizer.hpp"                  // 分词器类定义
+#include "logger.hpp"                     // 文件日志系统
 // 调试模式设置: 0: 无调试, 1: 测试操作时间, 2: 打印张量信息, 3: 打印输出张量
 #define DEBUG_MODE 0
 
@@ -363,15 +364,21 @@ private:
  * @return 创建的LLM实例指针
  */
 Llm* Llm::createLLM(const std::string& config_path) {
+    LOG_INFO("开始创建LLM实例，配置文件路径: " + config_path);
+    
     std::shared_ptr<LlmConfig> config(new LlmConfig(config_path));  // 解析配置文件
     Llm* llm = nullptr;
     
     // 根据配置判断是否需要多模态支持
     if (config->is_visual() || config->is_audio()) {
+        LOG_INFO("检测到多模态配置，创建多模态LLM实例(Mllm)");
         llm = new Mllm(config);  // 创建多模态LLM实例
     } else {
+        LOG_INFO("创建标准LLM实例");
         llm = new Llm(config);   // 创建标准LLM实例
     }
+    
+    LOG_INFO("LLM实例创建完成");
     return llm;
 }
 
@@ -448,11 +455,16 @@ int file_size_m(const std::string& filename) {
  * 以及各种运行时优化选项如量化、内存映射等。
  */
 void Llm::init_runtime() {
+    LOG_INFO("开始初始化运行时环境");
+    
     // 配置调度和后端参数
     ScheduleConfig config;
     BackendConfig cpuBackendConfig;
     config.type      = backend_type_convert(config_->backend_type());  // 设置后端类型
     config.numThread = config_->thread_num();                          // 设置线程数
+    
+    LOG_INFO("配置后端类型: " + config_->backend_type() + 
+             ", 线程数: " + std::to_string(config.numThread));
     
     // 设置全局执行器配置
     ExecutorScope::Current()->setGlobalExecutorConfig(config.type, cpuBackendConfig, config.numThread);
@@ -460,27 +472,34 @@ void Llm::init_runtime() {
     // 配置功耗模式
     if (config_->power() == "high") {
         cpuBackendConfig.power = BackendConfig::Power_High;      // 高性能模式
+        LOG_INFO("设置为高性能模式");
     } else if (config_->power() == "low") {
         cpuBackendConfig.power = BackendConfig::Power_Low;       // 低功耗模式
+        LOG_INFO("设置为低功耗模式");
     }
     
     // 配置内存使用策略
     if (config_->memory() == "high") {
         cpuBackendConfig.memory = BackendConfig::Memory_High;    // 高内存使用（更多缓存）
+        LOG_INFO("设置为高内存使用策略");
     } else if (config_->memory() == "low") {
         cpuBackendConfig.memory = BackendConfig::Memory_Low;     // 低内存使用（节省内存）
+        LOG_INFO("设置为低内存使用策略");
     }
     
     // 配置精度模式
     if (config_->precision() == "high") {
         cpuBackendConfig.precision = BackendConfig::Precision_High;  // 高精度计算
+        LOG_INFO("设置为高精度计算模式");
     } else if (config_->precision() == "low") {
         cpuBackendConfig.precision = BackendConfig::Precision_Low;   // 低精度计算（更快）
+        LOG_INFO("设置为低精度计算模式");
     }
     
     config.backendConfig = &cpuBackendConfig;
 
     // 创建运行时管理器
+    LOG_DEBUG("创建运行时管理器");
     runtime_manager_.reset(Executor::RuntimeManager::createRuntimeManager(config));
     
     // 设置各种运行时优化选项
@@ -491,16 +510,21 @@ void Llm::init_runtime() {
     runtime_manager_->setHint(MNN::Interpreter::MMAP_FILE_SIZE, file_size_m(config_->llm_weight()) + 128); // 内存映射文件大小
     runtime_manager_->setHint(MNN::Interpreter::USE_CACHED_MMAP, 1);                 // 使用缓存的内存映射
     
+    LOG_DEBUG("设置运行时优化选项: KV缓存限制=" + std::to_string(config_->kvcache_limit()) + 
+              ", QKV量化=" + std::to_string(config_->quant_qkv()));
+    
     std::string tmpPath = config_->tmp_path();
     
     // 配置KV缓存内存映射路径
     if (config_->kvcache_mmap()) {
         runtime_manager_->setExternalPath(tmpPath, MNN::Interpreter::EXTERNAL_PATH_KVCACHE_DIR);
+        LOG_INFO("启用KV缓存内存映射，路径: " + tmpPath);
     }
     
     // 配置权重内存映射路径
     if (config_->use_mmap()) {
         runtime_manager_->setExternalPath(tmpPath, MNN::Interpreter::EXTERNAL_WEIGHT_DIR);
+        LOG_INFO("启用权重内存映射，路径: " + tmpPath);
     }
     
     // 设置KV缓存元数据指针
@@ -510,21 +534,27 @@ void Llm::init_runtime() {
 #if DEBUG_MODE == 1
     runtime_manager_->setMode(MNN::Interpreter::Session_Debug);  // 启用调试模式
     _initTimeTrace();                                            // 初始化时间追踪
+    LOG_DEBUG("启用调试模式: 时间追踪");
 #endif
 #if DEBUG_MODE == 2
     runtime_manager_->setMode(MNN::Interpreter::Session_Debug);  // 启用调试模式
     _initTensorStatic();                                         // 初始化张量统计
+    LOG_DEBUG("启用调试模式: 张量统计");
 #endif
 #if DEBUG_MODE == 3
     runtime_manager_->setMode(MNN::Interpreter::Session_Debug);  // 启用调试模式
     _initDebug();                                                // 初始化调试信息
+    LOG_DEBUG("启用调试模式: 完整调试");
 #endif
     
     // 设置缓存文件路径
     {
         std::string cacheFilePath = tmpPath.length() != 0 ? tmpPath : ".";  // 默认使用当前目录
         runtime_manager_->setCache(cacheFilePath + "/mnn_cachefile.bin");   // 设置缓存文件
+        LOG_DEBUG("设置缓存文件路径: " + cacheFilePath + "/mnn_cachefile.bin");
     }
+    
+    LOG_INFO("运行时环境初始化完成");
 }
 
 /**
@@ -534,42 +564,61 @@ void Llm::init_runtime() {
  * 同时会创建用于prefill和decode阶段的模块副本，以优化不同阶段的推理性能。
  */
 void Llm::load() {
+    LOG_INFO("开始加载模型");
+    
     init_runtime();
     // init module status
     // 1. load vocab
+    LOG_INFO("加载分词器");
     MNN_PRINT("load tokenizer\n");
     tokenizer_.reset(Tokenizer::createTokenizer(config_->tokenizer_file()));
     MNN_PRINT("load tokenizer Done\n");
+    LOG_INFO("分词器加载完成");
+    
+    LOG_INFO("初始化磁盘嵌入");
     disk_embedding_.reset(new DiskEmbedding(config_));
+    
     // 3. load model
+    LOG_INFO("配置模块参数");
     Module::Config module_config;
     if (config_->backend_type() == "opencl" || config_->backend_type() == "vulkan") {
         module_config.shapeMutable = false;
+        LOG_DEBUG("设置为固定形状模式(opencl/vulkan)");
     } else {
         module_config.shapeMutable = true;
+        LOG_DEBUG("设置为可变形状模式");
     }
     module_config.rearrange    = true;
     // using base module for lora module
     if (base_module_ != nullptr) {
         module_config.base = base_module_;
+        LOG_INFO("使用基础模块进行LoRA加载");
     }
     int layer_nums = config_->layer_nums();
+    LOG_INFO("模型层数: " + std::to_string(layer_nums));
+    
     // load single model
     modules_.resize(1);
     std::string model_path = config_->llm_model();
+    LOG_INFO("加载模型文件: " + model_path);
     MNN_PRINT("load %s ... ", model_path.c_str());
     runtime_manager_->setExternalFile(config_->llm_weight());
     modules_[0].reset(Module::load(
                                        {"input_ids", "attention_mask", "position_ids"},
                                        {"logits"}, model_path.c_str(), runtime_manager_, &module_config));
     MNN_PRINT("Load Module Done!\n");
+    LOG_INFO("主模块加载完成");
+    
+    LOG_INFO("创建解码模块副本");
     decode_modules_.resize(modules_.size());
     for (int v = 0; v < modules_.size(); ++v) {
         decode_modules_[v].reset(Module::clone(modules_[v].get()));
     }
     MNN_PRINT("Clone Decode Module Done!\n");
+    LOG_INFO("解码模块副本创建完成");
 
     prefill_modules_ = modules_;
+    LOG_INFO("模型加载完成");
 }
 
 /**
@@ -1096,9 +1145,13 @@ void Llm::generate(int max_token) {
  * @return 生成的token ID序列
  */
 std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens) {
+    LOG_INFO("开始生成过程，输入token数量: " + std::to_string(input_ids.size()));
+    
     if (max_tokens < 0) {
         max_tokens = config_->max_new_tokens();  // 使用配置文件中的默认最大token数
     }
+    
+    LOG_INFO("最大生成token数量: " + std::to_string(max_tokens));
     
     // 设置KV缓存和状态信息
     mMeta->add = input_ids.size();  // 标记需要添加的token数量（即输入序列长度）
@@ -1109,33 +1162,41 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
     auto st = std::chrono::system_clock::now();  // 记录预填充开始时间
     
     // === 预填充阶段（Prefill Phase）===
+    LOG_INFO("开始预填充阶段");
     // 使用预填充模块处理整个输入序列，一次性计算所有输入token的KV缓存
     current_modules_ = prefill_modules_;
     auto logits = forward(input_ids);  // 前向推理，生成最后一个位置的logits
     
     if (nullptr == logits.get()) {
+        LOG_ERROR("预填充阶段失败，logits为空");
         return {};  // 预填充失败，返回空结果
     }
     
     // 采样第一个生成的token
     mState.current_token_ = sample(logits, mState.history_ids_);
+    LOG_DEBUG("预填充完成，首个生成token: " + std::to_string(mState.current_token_));
     logits = nullptr;  // 释放logits内存
     
     auto et = std::chrono::system_clock::now();  // 记录预填充结束时间
     
     // === 解码阶段准备（Decode Phase Setup）===
+    LOG_INFO("切换到解码阶段");
     current_modules_ = decode_modules_;  // 切换到解码模块（针对单token推理优化）
     // 记录预填充阶段耗时
     mState.prefill_us_ = std::chrono::duration_cast<std::chrono::microseconds>(et - st).count();
+    LOG_DEBUG("预填充耗时: " + std::to_string(mState.prefill_us_ / 1000.0) + " ms");
     mMeta->sync();  // 同步KV缓存状态
     
     // === 解码阶段（Decode Phase）===
+    LOG_INFO("开始解码阶段，目标生成token数: " + std::to_string(max_tokens));
     // 逐个生成新token，直到达到最大数量或遇到停止条件
     generate(max_tokens);
 
 #ifdef DUMP_PROFILE_INFO
     print_speed();  // 如果启用性能分析，打印速度统计信息
 #endif
+    
+    LOG_INFO("生成过程完成，实际生成token数: " + std::to_string(mState.gen_seq_len_));
     return mState.output_ids_;  // 返回生成的token序列
 }
 
@@ -1206,7 +1267,12 @@ void Llm::response(const std::vector<PromptItem>& chat_prompts, std::ostream* os
  * @param config 模型配置指针
  */
 Llm::Llm(std::shared_ptr<LlmConfig> config) : config_(config) {
+    // 初始化日志系统
+    Logger::getInstance().init();
+    LOG_INFO("创建Llm实例");
+    
     mMeta.reset(new KVMeta);
+    LOG_DEBUG("KV缓存元数据初始化完成");
 }
 
 /**
@@ -1216,6 +1282,8 @@ Llm::Llm(std::shared_ptr<LlmConfig> config) : config_(config) {
  * 如果启用了调试模式，还会打印性能统计信息。
  */
 Llm::~Llm() {
+    LOG_INFO("开始销毁Llm实例");
+    
 #if DEBUG_MODE == 1
     if (nullptr != gTimeTraceInfo) {
         float opSummer       = 0.0f;
@@ -1240,11 +1308,16 @@ Llm::~Llm() {
                   opFlopsSummber / opSummer);
     }
 #endif
+    
+    LOG_DEBUG("清理模块资源");
     current_modules_.clear();
     decode_modules_.clear();
     prefill_modules_.clear();
     modules_.clear();
     runtime_manager_.reset();
+    
+    LOG_INFO("Llm实例销毁完成");
+    Logger::getInstance().flush();
 }
 
 /**
