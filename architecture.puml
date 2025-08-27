@@ -1,0 +1,36 @@
+@startuml MNN-LLM架构图
+!define RECTANGLE class
+
+package "应用业务层" as app #LightBlue {
+    RECTANGLE "对话管理\nchat()" as chat
+    RECTANGLE "性能监控\nbenchmark()" as benchmark
+}
+
+package "模型封装层" as model #LightGreen {
+    RECTANGLE "LLM核心类\nresponse()" as llm_core
+    RECTANGLE "配置管理\nLlmConfig" as config
+}
+
+package "数据处理层" as data #LightYellow {
+    RECTANGLE "文本分词\nTokenizer" as tokenizer
+    RECTANGLE "格式转换\nembedding()" as embedding
+}
+
+package "MNN推理层" as mnn #LightPink {
+    RECTANGLE "MNN::Express API\nModule::load() / forward()" as mnn_api
+}
+
+chat --> llm_core : 调用
+benchmark --> llm_core : 调用
+config --> llm_core : 配置
+llm_core --> tokenizer : 分词
+llm_core --> embedding : 嵌入
+tokenizer --> mnn_api : 推理
+embedding --> mnn_api : 推理
+
+note top of app : 业务逻辑
+note top of model : MNN API封装
+note top of data : 预处理/后处理
+note top of mnn : 框架提供
+
+@enduml

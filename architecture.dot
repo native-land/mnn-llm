@@ -1,0 +1,44 @@
+digraph MNN_LLM_Architecture {
+    rankdir=TB;
+    node [shape=rectangle, style=filled];
+    
+    // 应用业务层
+    subgraph cluster_app {
+        label="应用业务层\n业务逻辑";
+        color=lightblue;
+        chat [label="对话管理\nchat()", fillcolor=lightcyan];
+        benchmark [label="性能监控\nbenchmark()", fillcolor=lightcyan];
+    }
+    
+    // 模型封装层
+    subgraph cluster_model {
+        label="模型封装层\nMNN API封装";
+        color=lightgreen;
+        llm_core [label="LLM核心类\nresponse()", fillcolor=lightgreen];
+        config [label="配置管理\nLlmConfig", fillcolor=lightgreen];
+    }
+    
+    // 数据处理层
+    subgraph cluster_data {
+        label="数据处理层\n预处理/后处理";
+        color=lightyellow;
+        tokenizer [label="文本分词\nTokenizer", fillcolor=lightyellow];
+        embedding [label="格式转换\nembedding()", fillcolor=lightyellow];
+    }
+    
+    // MNN推理层
+    subgraph cluster_mnn {
+        label="MNN推理层\n框架提供";
+        color=lightpink;
+        mnn_api [label="MNN::Express API\nModule::load() / forward()", fillcolor=lightpink];
+    }
+    
+    // 连接关系
+    chat -> llm_core;
+    benchmark -> llm_core;
+    config -> llm_core;
+    llm_core -> tokenizer;
+    llm_core -> embedding;
+    tokenizer -> mnn_api;
+    embedding -> mnn_api;
+}
