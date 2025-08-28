@@ -804,13 +804,51 @@ void Llm::switchMode(Llm::Stage stage) {
  * @return 推理结果logits张量，推理失败返回nullptr
  */
 MNN::Express::VARP Llm::forwardRaw(MNN::Express::VARP hiddenState, MNN::Express::VARP mask, MNN::Express::VARP inputPos) {
+
+    LOG_DEBUG("forwardRaw start");
+    // 声明用于存储输出logits的变量
     VARP logits;
+    
+    // 创建输出向量容器，用于接收模型的前向推理结果
     std::vector<MNN::Express::VARP> outputs;
+    
+    // 调用当前模块的前向推理方法，传入隐藏状态、注意力掩码和位置信息
+    // current_modules_.back() 获取当前使用的模块（prefill或decode模块）
+    // onForward 执行实际的神经网络前向计算过程
     outputs = current_modules_.back()->onForward({hiddenState, mask, inputPos});
+    
+    // 打印outputs的详细信息用于调试和监控
+    std::string outputs_info = "前向推理完成，outputs数量: " + std::to_string(outputs.size());
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        outputs_info += " | outputs[" + std::to_string(i) + "]";
+        if (outputs[i].get() != nullptr) {
+            auto info = outputs[i]->getInfo();
+            std::string dims_str = "[";
+            for (size_t j = 0; j < info->dim.size(); ++j) {
+                if (j > 0) dims_str += ", ";
+                dims_str += std::to_string(info->dim[j]);
+            }
+            dims_str += "]";
+            outputs_info += ": 维度" + dims_str + ", 总元素数" + std::to_string(info->size) + 
+                           ", 数据类型" + (info->type == halide_type_of<float>() ? "float" : "other");
+        } else {
+            outputs_info += ": nullptr";
+        }
+    }
+    LOG_DEBUG(outputs_info);
+
+    // 检查输出是否为空，如果为空则说明推理失败
     if (outputs.empty()) {
+        LOG_ERROR("前向推理失败：outputs为空");
         return nullptr;
     }
+    
+    // 提取第一个输出作为logits（通常模型只有一个输出）
+    // logits包含了词汇表中每个token的未归一化概率分数
     logits = outputs[0];
+
+    LOG_DEBUG("forwardRaw end");
+    // 返回logits张量，供后续的采样或其他处理使用
     return logits;
 }
 
@@ -825,13 +863,29 @@ MNN::Express::VARP Llm::forwardRaw(MNN::Express::VARP hiddenState, MNN::Express:
  * @return 推理结果logits张量，推理失败返回nullptr
  */
 VARP Llm::forward(const std::vector<int>& input_ids) {
+    // 获取输入序列长度
     int seq_len         = input_ids.size();
+    
+    // 生成注意力掩码，用于控制模型在计算注意力时哪些位置可以被关注
     auto attention_mask = gen_attention_mask(seq_len);
+    
+    // 生成位置编码ID，用于表示序列中每个token的位置信息
     auto position_ids = gen_position_ids(seq_len);
+    
+    // 将输入的token ID序列转换为嵌入向量表示
     auto hidden_states = embedding(input_ids);
+    
+    // 调用原始前向推理函数，传入嵌入向量、注意力掩码和位置ID
+    // 执行Transformer模型的完整前向计算过程
     auto logits = forwardRaw(hidden_states, attention_mask, position_ids);
+    
+    // 更新状态：累加总序列长度
     mState.all_seq_len_ += seq_len;
+    
+    // 更新状态：递增生成序列计数器
     mState.gen_seq_len_++;
+    
+    // 返回模型输出的logits（未归一化的概率分布）
     return logits;
 }
 
@@ -1128,6 +1182,7 @@ void Llm::generate(int max_token) {
         
         // 检查是否遇到停止token
         if (is_stop(mState.current_token_) && nullptr != mState.os_) {
+
             *mState.os_ << mState.end_with_ << std::flush;  // 输出结束标记
             break;  // 遇到停止token，结束生成
         }
@@ -1237,6 +1292,16 @@ void Llm::response(const std::string& user_content, std::ostream* os, const char
     generate_init(os, end_with);
     std::vector<int> input_ids;
     input_ids = tokenizer_encode(user_content);
+    
+    // 构建input_ids的完整日志信息
+    std::string ids_str = "input_ids: [";
+    for (size_t i = 0; i < input_ids.size(); ++i) {
+        if (i > 0) ids_str += ", ";
+        ids_str += std::to_string(input_ids[i]);
+    }
+    ids_str += "]";
+    LOG_INFO(ids_str);
+
     generate(input_ids, max_new_tokens);
 }
 

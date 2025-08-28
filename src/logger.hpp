@@ -47,9 +47,9 @@ public:
      * @brief 初始化日志系统
      * 
      * @param filename 日志文件名，默认为"mnn_llm.log"
-     * @param level 日志级别，默认为INFO
+     * @param level 日志级别，默认为DEBUG
      */
-    void init(const std::string& filename = "mnn_llm.log", LogLevel level = INFO);
+    void init(const std::string& filename = "mnn_llm.log", LogLevel level = DEBUG);
     
     /**
      * @brief 写入日志
